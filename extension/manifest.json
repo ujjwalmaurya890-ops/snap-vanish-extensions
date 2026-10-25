@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "Snap Vanish",
+  "version": "2.0.0",
+  "description": "Snap your fingers on camera and dissolve with reversible particle effects. Local processing, configurable studio presets, and emergency restore.",
+  "minimum_chrome_version": "121",
+  "permissions": ["activeTab", "storage"],
+  "host_permissions": [
+    "https://meet.google.com/*",
+    "https://teams.microsoft.com/*",
+    "https://*.zoom.us/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Snap Vanish Studio",
+    "default_popup": "popup/popup.html"
+  },
+  "commands": {
+    "toggle-snap": {
+      "suggested_key": { "default": "Alt+Shift+S" },
+      "description": "Toggle the snap (vanish / return)"
+    },
+    "vanish-now": {
+      "suggested_key": { "default": "Alt+Shift+D" },
+      "description": "Vanish immediately, bypassing gesture detection"
+    },
+    "mute-only": {
+      "suggested_key": { "default": "Alt+Shift+M" },
+      "description": "Mute or unmute without vanishing"
+    },
+    "reset-frame": {
+      "suggested_key": { "default": "Alt+Shift+R" },
+      "description": "Emergency restore to the live camera feed"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://meet.google.com/*",
+        "https://teams.microsoft.com/*",
+        "https://*.zoom.us/*"
+      ],
+      "js": ["content/snap-vanish.js"],
+      "css": ["content/snap-vanish.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' wasm-unsafe-eval; object-src 'self'"
+  }
+}

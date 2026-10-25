@@ -1,0 +1,72 @@
+/* Snap Vanish — Content Script Overlay & Status HUD */
+
+.snap-vanish-overlay-canvas {
+  position: absolute !important;
+  inset: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: cover !important;
+  pointer-events: none !important;
+  z-index: 2147483640 !important;
+  transition: opacity 160ms ease-out;
+}
+
+.snap-vanish-hud {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 2147483646;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(15, 16, 24, 0.92);
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  color: #f4f4f6;
+  font: 500 12px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(8px);
+}
+
+.snap-vanish-hud[data-hidden="true"] {
+  display: none !important;
+}
+
+.snap-vanish-hud-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.6);
+}
+
+.snap-vanish-hud[data-state="vanishing"] .snap-vanish-hud-dot,
+.snap-vanish-hud[data-state="restoring"] .snap-vanish-hud-dot {
+  background: #f59e0b;
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.7);
+}
+
+.snap-vanish-hud[data-state="vanished"] .snap-vanish-hud-dot {
+  background: #8b5cf6;
+  box-shadow: 0 0 8px rgba(139, 92, 246, 0.7);
+}
+
+.snap-vanish-hud[data-state="error"] .snap-vanish-hud-dot {
+  background: #ef4444;
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.7);
+}
+
+.snap-vanish-hud-restore-btn {
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(239, 68, 68, 0.2);
+  color: #fecaca;
+  font: 600 11px/1 inherit;
+  cursor: pointer;
+}
+
+.snap-vanish-hud-restore-btn:hover {
+  background: rgba(239, 68, 68, 0.38);
+}
