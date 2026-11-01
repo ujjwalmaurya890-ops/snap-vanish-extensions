@@ -300,11 +300,17 @@ describe("Snap Vanish 2.0 — Comprehensive Unit, Integration, DOM & Build Suite
         stop: vi.fn(),
       };
 
-      const replaceTrackSpy = vi.fn(async () => undefined);
+      // Spec-faithful double: `RTCRtpSender.track` reflects the most recently
+      // replaced track, which is what makes the bridge's "already restored"
+      // fast-path observable.
       const mockSender = {
-        track: hardwareCameraTrack,
-        replaceTrack: replaceTrackSpy,
+        track: hardwareCameraTrack as Record<string, unknown>,
+        replaceTrack: vi.fn(async (next: Record<string, unknown>) => {
+          mockSender.track = next;
+          return undefined;
+        }),
       };
+      const replaceTrackSpy = mockSender.replaceTrack;
 
       class MockRTCPeerConnection extends EventTarget {
         connectionState = "connected";

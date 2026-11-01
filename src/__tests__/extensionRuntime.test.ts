@@ -11,8 +11,49 @@ describe("7. Chrome Extension Manifest, Service Worker & Content Script Verifica
     const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
     expect(manifest.manifest_version).toBe(3);
     expect(manifest.version).toBe("2.0.0");
-    expect(manifest.permissions).toEqual(["activeTab", "storage"]);
-    expect(manifest.permissions).not.toContain("offscreen");
+    // Minimal permission surface: no "tabs", no "activeTab", no "<all_urls>".
+    expect(manifest.permissions).toEqual(["storage", "offscreen"]);
+    expect(manifest.permissions).not.toContain("tabs");
+    expect(manifest.permissions).not.toContain("activeTab");
+    expect(manifest.permissions).not.toContain("scripting");
+
+    // Host access is scoped to the five supported meeting origins only.
+    expect(Array.isArray(manifest.host_permissions)).toBe(true);
+    expect(manifest.host_permissions.length).toBe(5);
+    for (const pattern of manifest.host_permissions) {
+      expect(pattern).toMatch(/^https:\/\//);
+      expect(pattern).not.toContain("<all_urls>");
+    }
+
+    // Web-accessible resources must be explicitly enumerated (no "vendor/*"
+    // wildcards exposing the whole extension bundle) and only to meeting origins.
+    const war = manifest.web_accessible_resources.flatMap(
+      (entry: { resources: string[] }) => entry.resources,
+    );
+    expect(war.length).toBeGreaterThan(0);
+    for (const resource of war) {
+      expect(resource.startsWith("*")).toBe(false);
+      expect(resource.endsWith("/*")).toBe(false);
+    }
+
+    // MV3 CSP: inline scripts stay blocked while WebAssembly is allowed.
+    const csp = manifest.content_security_policy.extension_pages;
+    expect(csp).toContain("'wasm-unsafe-eval'");
+    expect(csp).toContain("'self'");
+    expect(csp).not.toContain("'unsafe-eval'");
+    expect(csp).not.toContain("'unsafe-inline'");
+
+    // Offscreen document declared by the worker must exist and be CSP-clean.
+    const offscreenPath = path.resolve(
+      process.cwd(),
+      "extension/offscreen/offscreen.html",
+    );
+    expect(fs.existsSync(offscreenPath)).toBe(true);
+    const offscreenHtml = fs.readFileSync(offscreenPath, "utf8");
+    expect(offscreenHtml).not.toMatch(/<script(?![^>]*src=)/i);
+    expect(
+      fs.existsSync(path.resolve(process.cwd(), "extension/offscreen/offscreen.js")),
+    ).toBe(true);
 
     // Verify service worker exists
     const swPath = path.resolve(
@@ -21,6 +62,19 @@ describe("7. Chrome Extension Manifest, Service Worker & Content Script Verifica
       manifest.background.service_worker,
     );
     expect(fs.existsSync(swPath)).toBe(true);
+
+    // MV3 lifecycle: the worker must not cache state in module-scope `let`/`var`
+    // that it later trusts after a suspension. `offscreenCreating` is the single
+    // whitelisted single-flight guard.
+    const swSource = fs.readFileSync(swPath, "utf8");
+    const mutableModuleBindings = [
+      ...swSource.matchAll(/^(?:let|var)\s+([A-Za-z_$][\w$]*)/gm),
+    ].map((m) => m[1]);
+    const whitelisted = new Set(["offscreenCreating", "lastWrittenState"]);
+    const illegal = mutableModuleBindings.filter((n) => !whitelisted.has(n));
+    expect(illegal).toEqual([]);
+    expect(swSource).toContain("chrome.storage.session");
+    expect(swSource).toContain("chrome.runtime.getContexts");
 
     // Verify popup exists
     const popupPath = path.resolve(

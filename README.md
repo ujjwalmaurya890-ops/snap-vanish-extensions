@@ -102,12 +102,24 @@ npm run build:extension
 
 ---
 
+## Performance & Architecture Audit
+
+The full principal-engineer optimization report — MV3 lifecycle audit, offscreen/CSP topology,
+particle-engine measurements, WebGL/WebGPU migration path, and the phased roadmap — lives in
+[`docs/OPTIMIZATION_REPORT.md`](docs/OPTIMIZATION_REPORT.md). Reproduce the frame-cost numbers with:
+
+```bash
+npm run bench      # DustScene render-loop micro-benchmark (before/after)
+npm run verify     # typecheck + tests + extension packaging & manifest gates
+```
+
 ## Permissions & Privacy Architecture
 
 | Permission / Directive | Scope | Purpose |
 | :--- | :--- | :--- |
-| `storage` | Local & Sync | Stores compact preferences in `chrome.storage.sync` and optional metadata-only event counts/custom presets in `chrome.storage.local`. |
-| `activeTab` | Active tab on user action | Allows toolbar popup and global shortcut commands to communicate with the active meeting tab without broad `tabs` history access. |
+| `storage` | Local, Sync & Session | Compact preferences in `chrome.storage.sync`, optional metadata-only counts/custom presets in `chrome.storage.local`, and per-tab routing state in `chrome.storage.session` (the service worker keeps no in-memory state). |
+| `offscreen` | `AUDIO_PLAYBACK` document | Plays the snap-confirmation cue without an `AudioContext` in the meeting page, and without depending on page user activation (keyboard-shortcut path). |
+| `host_permissions` | The five supported meeting origins | Lets the service worker resolve which meeting tab a command targets. No `tabs`, no `activeTab`, no `<all_urls>`. |
 | `content_scripts` & `web_accessible_resources` | `meet.google.com`, `teams.microsoft.com`, `teams.live.com`, `*.zoom.us/wc/*` | Injects WebRTC sender bridge + isolated MediaPipe hand inference strictly on supported conferencing domains (never `<all_urls>`). |
 | `'wasm-unsafe-eval'` | Extension pages CSP | Required by Chrome Manifest V3 to compile bundled local MediaPipe WebAssembly binaries. Inline scripts remain strictly forbidden. |
 

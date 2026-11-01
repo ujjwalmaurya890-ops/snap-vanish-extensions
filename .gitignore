@@ -6,3 +6,6 @@ dist/
 .vite/
 .vitest-cache/
 *.log
+
+# Build artifacts — regenerate with `npm run build:extension`
+snap-vanish-chrome-extension.zip

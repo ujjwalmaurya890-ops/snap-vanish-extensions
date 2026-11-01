@@ -11,12 +11,13 @@
     "preview": "vite preview --host 0.0.0.0",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "bench": "vite-node scripts/bench-dust.mts",
+    "verify": "tsc --noEmit && vitest run && node scripts/build-extension.mjs"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.2.0",
     "clsx": "2.1.1",
-    "framer-motion": "^14.6.0",
     "lucide-react": "^1.66.0",
     "react": "19.2.6",
     "react-dom": "19.2.6",
@@ -32,7 +33,6 @@
     "tailwindcss": "4.1.17",
     "typescript": "5.9.3",
     "vite": "7.3.2",
-    "vite-plugin-singlefile": "2.3.0",
     "vitest": "^5.0.5"
   }
 }

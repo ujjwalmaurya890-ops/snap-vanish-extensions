@@ -1,9 +1,12 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
+    /* Chrome 121 is the manifest floor; ES2022 gives Object.hasOwn, top-level
+       await, and .at() without any runtime help. */
+    "target": "ES2022",
     "useDefineForClassFields": true,
-    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "module": "ESNext",
+    "moduleDetection": "force",
     "skipLibCheck": true,
     "types": ["node"],
 
@@ -25,7 +28,9 @@
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "noFallthroughCasesInSwitch": true
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "forceConsistentCasingInFileNames": true
   },
   "include": ["src", "vite.config.ts"]
 }

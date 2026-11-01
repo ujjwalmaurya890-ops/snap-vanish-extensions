@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Snap Vanish — Offscreen Audio</title>
+  </head>
+  <body>
+    <!--
+      Extension-origin DOM surface. Created on demand by the service worker with
+      `reasons: ["AUDIO_PLAYBACK"]`, which exempts this document from the page's
+      autoplay policy and from the meeting page's CSP.
+
+      No inline script or style: MV3 `script-src 'self'` forbids it.
+    -->
+    <script src="offscreen.js"></script>
+  </body>
+</html>
