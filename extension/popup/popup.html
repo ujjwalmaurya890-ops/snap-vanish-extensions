@@ -1,16 +1,16 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Snap Vanish 2.0</title>
+    <title>Snap Vanish</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
     <div class="popup-shell">
       <header class="popup-header">
         <div class="brand">
-          <svg width="20" height="20" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 28 28" fill="none" aria-hidden="true">
             <path d="M14 3.5 A 10.5 10.5 0 0 0 14 24.5 L 14 3.5 Z" fill="#f0623a" />
             <rect x="15.4" y="6.2" width="3" height="3" rx="0.6" fill="#ff8a65" />
             <rect x="15.4" y="12.2" width="3" height="3" rx="0.6" fill="#f0623a" />
@@ -20,22 +20,31 @@
           </svg>
           <div>
             <div class="brand-name">Snap Vanish</div>
-            <div class="brand-sub">v2.0 · MV3 LOCAL AI</div>
+            <div class="brand-sub" id="brand-version">MV3 · LOCAL AI</div>
           </div>
         </div>
-        <button
-          type="button"
-          id="master-toggle"
-          role="switch"
-          aria-checked="true"
-          aria-label="Enable Snap Vanish"
-          class="switch-btn"
-        >
-          <span class="switch-thumb"></span>
-        </button>
+        <div class="header-actions">
+          <button
+            type="button"
+            id="theme-toggle"
+            class="icon-btn"
+            aria-label="Toggle light or dark theme"
+            title="Toggle theme"
+          >◐</button>
+          <button
+            type="button"
+            id="master-toggle"
+            role="switch"
+            aria-checked="true"
+            aria-label="Enable Snap Vanish"
+            class="switch-btn"
+          >
+            <span class="switch-thumb"></span>
+          </button>
+        </div>
       </header>
 
-      <div class="status-strip">
+      <div class="status-strip" role="status" aria-live="polite">
         <div class="status-left">
           <span id="status-dot" class="status-dot"></span>
           <span id="status-text">ARMED · READY</span>
@@ -44,15 +53,54 @@
       </div>
 
       <main class="popup-body">
+        <!-- Live, truthful status (populated from GET_STATE, never fabricated) -->
+        <section class="status-grid" aria-label="Live status">
+          <div class="status-cell">
+            <span class="status-cell-label">Camera</span>
+            <span class="status-cell-value"><span class="mini-dot" id="dot-camera"></span><span id="stat-camera">—</span></span>
+          </div>
+          <div class="status-cell">
+            <span class="status-cell-label">Microphone</span>
+            <span class="status-cell-value"><span class="mini-dot" id="dot-mic"></span><span id="stat-mic">—</span></span>
+          </div>
+          <div class="status-cell">
+            <span class="status-cell-label">Hand AI</span>
+            <span class="status-cell-value"><span class="mini-dot" id="dot-hand"></span><span id="stat-hand">—</span></span>
+          </div>
+          <div class="status-cell">
+            <span class="status-cell-label">Detection</span>
+            <span class="status-cell-value"><span class="mini-dot" id="dot-detection"></span><span id="stat-detection">—</span></span>
+          </div>
+          <div class="status-cell">
+            <span class="status-cell-label">Animation</span>
+            <span class="status-cell-value"><span class="mini-dot" id="dot-anim"></span><span id="stat-anim">—</span></span>
+          </div>
+          <div class="status-cell">
+            <span class="status-cell-label">Outgoing Stream</span>
+            <span class="status-cell-value"><span class="mini-dot" id="dot-stream"></span><span id="stat-stream">—</span></span>
+          </div>
+        </section>
+
         <div class="field">
-          <label for="preset-select" class="field-label">Active Effect Preset</label>
+          <span class="field-label" id="mode-label">Detection Mode</span>
+          <div class="segmented" role="radiogroup" aria-labelledby="mode-label" id="mode-group">
+            <button type="button" role="radio" aria-checked="true" data-mode="smart" class="seg-btn" title="Gesture + acoustic confirmation">Smart</button>
+            <button type="button" role="radio" aria-checked="false" data-mode="gesture-only" class="seg-btn" title="Gesture only — microphone never opens">Gesture</button>
+            <button type="button" role="radio" aria-checked="false" data-mode="manual" class="seg-btn" title="Popup / HUD / shortcut only">Manual</button>
+          </div>
+          <span class="field-hint" id="mode-hint">Gesture confirmed by snap sound. Sound alone never triggers.</span>
+        </div>
+
+        <div class="field">
+          <label for="preset-select" class="field-label">Vanish Effect</label>
           <select id="preset-select" class="select-input">
             <option value="dust">Classic Dust (1.8s)</option>
-            <option value="cinematic-disintegration">Cinematic Disintegration (2.2s)</option>
-            <option value="fine-particles">Fine Particles (1.7s)</option>
+            <option value="cinematic-disintegration">Infinity Snap — Spiral (2.2s)</option>
             <option value="light-burst">Energy Burst (1.5s)</option>
-            <option value="fade-out">Gentle Fade (1.2s)</option>
-            <option value="reverse-assembly">Reverse Assembly (1.8s)</option>
+            <option value="fade-out">Smoke Dissolve (2.0s)</option>
+            <option value="digital-glitch">Digital Disintegration (1.6s)</option>
+            <option value="fine-particles">Fine Ash (1.7s)</option>
+            <option value="reverse-assembly">Reverse Reconstruction (1.8s)</option>
           </select>
         </div>
 
@@ -65,9 +113,9 @@
         </div>
 
         <div class="toggles-grid">
-          <button type="button" id="audio-toggle" class="pill-toggle" data-on="true">
-            <span>Acoustic Gate</span>
-            <strong id="audio-state">ON</strong>
+          <button type="button" id="mic-toggle" class="pill-toggle" data-on="false" title="Toggle your meeting microphone (Alt+Shift+M)">
+            <span>Meeting Mic</span>
+            <strong id="mic-state">—</strong>
           </button>
           <button type="button" id="lowpower-toggle" class="pill-toggle" data-on="false">
             <span>Low Power</span>
@@ -76,22 +124,33 @@
         </div>
 
         <div class="actions-row">
-          <button type="button" id="btn-vanish" class="btn btn-primary">
-            Test Vanish
-          </button>
-          <button
-            type="button"
-            id="btn-restore"
-            class="btn btn-danger"
-            title="Unconditionally restores live camera and mic (Alt+Shift+R)"
-          >
-            Emergency Restore
-          </button>
+          <button type="button" id="btn-vanish" class="btn btn-primary">Snap Now</button>
+          <button type="button" id="btn-return" class="btn btn-secondary">Return to Camera</button>
         </div>
+        <button
+          type="button"
+          id="btn-restore"
+          class="btn btn-danger btn-wide"
+          title="Unconditionally restores live camera and mic (Alt+Shift+R)"
+        >
+          Emergency Restore
+        </button>
+
+        <section class="shortcuts-box" aria-label="Keyboard shortcuts">
+          <div class="shortcuts-head">
+            <span class="field-label">Keyboard Shortcuts</span>
+            <button type="button" id="btn-customize-keys" class="link-btn">Customize…</button>
+          </div>
+          <div class="shortcut-row"><span>Enable / pause</span><kbd id="key-toggle-snap">Alt+Shift+S</kbd></div>
+          <div class="shortcut-row"><span>Vanish / return now</span><kbd id="key-vanish-now">Alt+Shift+D</kbd></div>
+          <div class="shortcut-row"><span>Toggle mic mute</span><kbd id="key-mute-only">Alt+Shift+M</kbd></div>
+          <div class="shortcut-row"><span>Emergency restore</span><kbd id="key-emergency-restore">Alt+Shift+R</kbd></div>
+          <span class="field-hint" id="keys-hint">Bindings shown are read live from Chrome. “Not set” means the key is unassigned or taken — use Customize to fix it.</span>
+        </section>
       </main>
 
       <footer class="popup-footer">
-        <span class="shortcut-hint">Alt+Shift+D · Alt+Shift+R</span>
+        <span class="privacy-note">🔒 100% local — no uploads</span>
         <button type="button" id="btn-open-studio" class="link-btn">
           Studio &amp; Settings →
         </button>

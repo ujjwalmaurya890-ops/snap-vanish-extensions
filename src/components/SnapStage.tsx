@@ -29,6 +29,7 @@ import {
 import { BackgroundReconstructor } from "../features/camera/backgroundReconstructor";
 import { LiveAudioConfirmationEngine } from "../features/audio/audioConfirmationEngine";
 import { classifyMediaError } from "../services/errorService";
+import { resolveDetectionPolicy } from "../lib/settings";
 import type {
   AppErrorCode,
   DetectionDiagnosticsState,
@@ -268,6 +269,7 @@ function SnapStageImpl({
       gestureDetectorRef.current = new SnapGestureDetector(
         fullSettings?.gesture ?? {
           enabled: true,
+          detectionMode: "smart",
           mode: "balanced",
           sensitivity,
           minHandConfidence: 0.62,
@@ -397,8 +399,12 @@ function SnapStageImpl({
       setCameraResolution(resLabel);
       onLiveCameraChange?.(true, resLabel);
 
-      // Start live audio confirmation monitor if enabled
-      if (fullSettings?.audio.enabled && fullSettings?.gesture.requireAudioConfirm) {
+      // Start live audio confirmation monitor only when the detection policy
+      // allows the microphone (Smart mode). Gesture/Manual never open the mic.
+      const policy = fullSettings
+        ? resolveDetectionPolicy(fullSettings)
+        : null;
+      if (policy?.microphoneAllowed && fullSettings) {
         const audioRes = await stableAudioEngine.start({
           preferredDeviceId: fullSettings.audio.preferredDeviceId || undefined,
           sensitivityDb: fullSettings.audio.sensitivityDb,
@@ -411,8 +417,9 @@ function SnapStageImpl({
         }
       }
 
-      // Initialize local MediaPipe HandLandmarker if automatic gesture detection is enabled
-      if (fullSettings?.gesture.enabled !== false) {
+      // Initialize local MediaPipe HandLandmarker only when automatic
+      // detection is active (never in Manual mode or when disabled).
+      if (policy?.detectionActive) {
         setModelLoadText("Loading local MediaPipe HandLandmarker…");
         const initRes = await stableHandService.initialize({
           minConfidence: fullSettings?.gesture.minHandConfidence ?? 0.62,
@@ -465,6 +472,7 @@ function SnapStageImpl({
     fullSettings?.audio.preferredDeviceId,
     fullSettings?.audio.sensitivityDb,
     fullSettings?.gesture.enabled,
+    fullSettings?.gesture.detectionMode,
     fullSettings?.gesture.minHandConfidence,
     fullSettings?.gesture.requireAudioConfirm,
     onDetectionDiagnostics,
@@ -699,8 +707,9 @@ function SnapStageImpl({
             }
           }
 
+          const framePolicy = resolveDetectionPolicy(cfg);
           if (
-            cfg.gesture?.enabled !== false &&
+            framePolicy.detectionActive &&
             stableHandService.currentStatus === "ready"
           ) {
             const inf = stableHandService.detectVideoFrame(liveVid, now);
@@ -711,7 +720,7 @@ function SnapStageImpl({
                 handConfidence: inf.confidence,
                 applySmoothing: true,
                 enforceLiveAudioGate: Boolean(
-                  cfg.gesture?.requireAudioConfirm && audioSnap?.active,
+                  framePolicy.requiresAudioConfirm && audioSnap?.active,
                 ),
                 recentAudioOnsetAt: audioSnap?.lastTransientAt ?? null,
                 audioConfirmWindowMs: cfg.audio?.confirmWindowMs ?? 220,

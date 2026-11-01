@@ -2,6 +2,7 @@ import {
   CURRENT_SETTINGS_SCHEMA_VERSION,
   type BackgroundMode,
   type DetectionMode,
+  type DetectionTriggerMode,
   type Direction,
   type EffectPreset,
   type EffectType,
@@ -54,6 +55,12 @@ export const VALID_DETECTION_MODES: readonly DetectionMode[] = [
   "balanced",
   "precision",
   "custom",
+] as const;
+
+export const VALID_DETECTION_TRIGGER_MODES: readonly DetectionTriggerMode[] = [
+  "smart",
+  "gesture-only",
+  "manual",
 ] as const;
 
 export const VALID_GESTURE_ACTIONS: readonly GestureAction[] = [
@@ -146,6 +153,7 @@ export const DEFAULT_SETTINGS: SnapSettings = {
   sensitivity: 62,
   gesture: {
     enabled: true,
+    detectionMode: "smart",
     mode: "balanced",
     sensitivity: 62,
     minHandConfidence: 0.62,
@@ -199,6 +207,52 @@ export const DEFAULT_SETTINGS: SnapSettings = {
     emergencyRestore: "Alt+Shift+R",
   },
 };
+
+export interface DetectionPolicy {
+  /** The stored trigger mode (defaults to "smart" for legacy payloads). */
+  mode: DetectionTriggerMode;
+  /** Automatic detection may run at all (extension on + gesture on + not manual). */
+  detectionActive: boolean;
+  /** A visual snap must be acoustically confirmed before it can trigger. */
+  requiresAudioConfirm: boolean;
+  /** The microphone may be opened for snap-confirmation analysis. */
+  microphoneAllowed: boolean;
+}
+
+/**
+ * Single source of truth for the three detection modes (brief §3).
+ * The Studio, popup, and content script all derive their behaviour from this
+ * policy so the surfaces can never disagree about whether the mic may open.
+ *
+ * - smart:        gesture + acoustic confirmation (mic allowed when audio on)
+ * - gesture-only: gesture alone (mic never opened)
+ * - manual:       no automatic detection (popup / HUD / shortcut only)
+ *
+ * Sound never triggers a vanish by itself in any mode.
+ */
+export function resolveDetectionPolicy(settings: {
+  enabled?: boolean;
+  gesture?: {
+    enabled?: boolean;
+    detectionMode?: DetectionTriggerMode;
+    requireAudioConfirm?: boolean;
+  };
+  audio?: { enabled?: boolean };
+}): DetectionPolicy {
+  const mode: DetectionTriggerMode =
+    settings.gesture?.detectionMode ?? "smart";
+  const detectionActive =
+    settings.enabled !== false &&
+    settings.gesture?.enabled !== false &&
+    mode !== "manual";
+  const requiresAudioConfirm =
+    mode === "smart" && settings.gesture?.requireAudioConfirm !== false;
+  const microphoneAllowed =
+    detectionActive &&
+    requiresAudioConfirm &&
+    settings.audio?.enabled !== false;
+  return { mode, detectionActive, requiresAudioConfirm, microphoneAllowed };
+}
 
 export interface MeetingModeDefinition {
   id: Exclude<MeetingModeId, "custom">;
@@ -785,6 +839,25 @@ export function validateSettings(
     hudPosition = raw.hudPosition as HudPosition;
   }
 
+  let detectionTriggerMode: DetectionTriggerMode =
+    base.gesture.detectionMode ?? "smart";
+  if (rawGesture.detectionMode !== undefined) {
+    if (
+      VALID_DETECTION_TRIGGER_MODES.includes(
+        rawGesture.detectionMode as DetectionTriggerMode,
+      )
+    ) {
+      detectionTriggerMode = rawGesture.detectionMode as DetectionTriggerMode;
+    } else {
+      issues.push({
+        field: "gesture.detectionMode",
+        message: `gesture.detectionMode must be one of: ${VALID_DETECTION_TRIGGER_MODES.join(", ")}`,
+        received: rawGesture.detectionMode,
+        correctedTo: detectionTriggerMode,
+      });
+    }
+  }
+
   let detectionMode: DetectionMode = base.gesture.mode;
   if (rawGesture.mode !== undefined) {
     if (VALID_DETECTION_MODES.includes(rawGesture.mode as DetectionMode)) {
@@ -951,6 +1024,7 @@ export function validateSettings(
         typeof rawGesture.enabled === "boolean"
           ? rawGesture.enabled
           : base.gesture.enabled,
+      detectionMode: detectionTriggerMode,
       mode: detectionMode,
       sensitivity,
       minHandConfidence,
