@@ -1,11 +1,13 @@
 /**
- * Snap Vanish — Multi-Effect Visual Engine (Dust, Pixel Dissolve, Digital Glitch, Fade-Out, Light-Burst).
+ * Snap Vanish 2.0 — Cinematic Multi-Effect Disintegration & Reconstruction Engine
  *
- * The person layer is eroded by a stack of pre-rendered soft-blob masks
- * (one per dissolving stage), while ~22k particles sampled from the person's
- * own pixels are advected along an analytic path. Analytic motion means every
- * effect can be evaluated at any t in [0, 1] — allowing both disintegration
- * (0 -> 1) and exact reassembly (1 -> 0).
+ * Implements:
+ * 1. Fine ash dust particles + larger rotating polygon shard fragments
+ * 2. Multi-plane z-depth parallax variation
+ * 3. Smooth acceleration/deceleration curves controlled by motionSmoothness
+ * 4. Pooled particle objects & pre-allocated stage canvases to avoid GC spikes
+ * 5. Live camera stream compositing on t === 0 (never freezes live camera on restore)
+ * 6. Deterministic analytic evaluation for t in [0, 1] (vanish 0->1, restore 1->0)
  */
 
 import type { Direction, EffectType } from "../types/snapVanish";
@@ -25,12 +27,16 @@ type Particle = {
   seed: number;
   size: number;
   power: number;
+  depth: number; // 0.4 (far) .. 1.45 (near) parallax depth plane
+  angle: number; // initial radians
+  spin: number; // rad per unit local progress
+  isFragment: boolean; // true = rotating shard fragment, false = fine dust grain
   r: number;
   g: number;
   b: number;
 };
 
-export type SceneStatus = "loading" | "ready" | "fallback";
+export type SceneStatus = "loading" | "ready" | "live-camera" | "fallback";
 
 export interface EffectRenderOptions {
   effect?: EffectType;
@@ -39,7 +45,11 @@ export interface EffectRenderOptions {
   density?: number;
   colorAccent?: string;
   intensity?: number;
+  motionSmoothness?: number;
+  maxParticles?: number;
   lowPowerMode?: boolean;
+  liveVideoSource?: HTMLVideoElement | null;
+  mirrorLiveVideo?: boolean;
 }
 
 export function hexToRgb(hex: string): { r: number; g: number; b: number } {
@@ -68,11 +78,20 @@ function drawCover(
   ih: number,
   w: number,
   h: number,
+  mirrored = false,
 ) {
   const s = Math.max(w / iw, h / ih);
   const dw = iw * s;
   const dh = ih * s;
-  ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
+  if (mirrored) {
+    ctx.save();
+    ctx.translate(w, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
+    ctx.restore();
+  } else {
+    ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
+  }
 }
 
 /** Generous seated-figure silhouette: head, neck, shoulders, torso, raised arm. */
@@ -81,10 +100,9 @@ function silhouette(ctx: CanvasRenderingContext2D, w: number, h: number) {
   const Y = (n: number) => n * h;
 
   ctx.beginPath();
-  // head
   ctx.ellipse(X(0.5), Y(0.285), X(0.115), Y(0.168), 0, 0, Math.PI * 2);
   ctx.fill();
-  // neck + shoulders + torso, generously oversized
+
   ctx.beginPath();
   ctx.moveTo(X(0.215), Y(1.08));
   ctx.lineTo(X(0.232), Y(0.62));
@@ -96,7 +114,7 @@ function silhouette(ctx: CanvasRenderingContext2D, w: number, h: number) {
   ctx.lineTo(X(0.785), Y(1.08));
   ctx.closePath();
   ctx.fill();
-  // arms: one resting, one raised (the snapping hand)
+
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   ctx.strokeStyle = "#000";
@@ -110,7 +128,7 @@ function silhouette(ctx: CanvasRenderingContext2D, w: number, h: number) {
   ctx.moveTo(X(0.675), Y(0.58));
   ctx.quadraticCurveTo(X(0.775), Y(0.6), X(0.788), Y(0.408));
   ctx.stroke();
-  // hand
+
   ctx.beginPath();
   ctx.ellipse(X(0.795), Y(0.362), X(0.072), Y(0.095), -0.25, 0, Math.PI * 2);
   ctx.fill();
@@ -132,6 +150,19 @@ export function windFor(dir: Direction): { x: number; y: number } {
   }
 }
 
+/**
+ * Blends power-curve acceleration with quintic smoothstep easing according to
+ * user-selected motionSmoothness [0..100].
+ */
+export function evaluateMotionCurve(local: number, smoothness = 70): number {
+  const clamped = Math.max(0, Math.min(1, local));
+  const s = Math.max(0, Math.min(100, smoothness)) / 100;
+  const accel = Math.pow(clamped, 1.24);
+  const quintic =
+    clamped * clamped * clamped * (clamped * (clamped * 6 - 15) + 10);
+  return accel * (1 - s * 0.65) + quintic * (s * 0.65);
+}
+
 export class DustScene {
   readonly w = FRAME_W;
   readonly h = FRAME_H;
@@ -141,9 +172,15 @@ export class DustScene {
 
   private room = makeCanvas(FRAME_W, FRAME_H);
   private person = makeCanvas(FRAME_W, FRAME_H);
+  private maskCanvas = makeCanvas(FRAME_W, FRAME_H);
   private scratch = makeCanvas(FRAME_W, FRAME_H);
+  private erodeAcc = makeCanvas(
+    Math.round(FRAME_W * ERODE_SCALE),
+    Math.round(FRAME_H * ERODE_SCALE),
+  );
   private erode: HTMLCanvasElement[] = [];
-  private particles: Particle[] = [];
+  private particlePool: Particle[] = [];
+  private activePoolLength = 0;
   private blob = makeCanvas(64, 64);
 
   constructor() {
@@ -156,10 +193,20 @@ export class DustScene {
       b.fillStyle = g;
       b.fillRect(0, 0, 64, 64);
     }
+
+    const ew = Math.round(this.w * ERODE_SCALE);
+    const eh = Math.round(this.h * ERODE_SCALE);
+    for (let s = 0; s < STAGES; s++) {
+      this.erode.push(makeCanvas(ew, eh));
+    }
   }
 
-  /** Build from bitmaps; falls back to procedural art if an image is missing. */
-  build(roomImg: HTMLImageElement | null, personImg: HTMLImageElement | null) {
+  /** Build from static bitmaps; falls back to procedural art if an image is missing. */
+  build(
+    roomImg: HTMLImageElement | null,
+    personImg: HTMLImageElement | null,
+    maxParticles = 22000,
+  ) {
     const { w, h } = this;
     const roomCtx = this.room.getContext("2d");
     const perCtx = this.person.getContext("2d");
@@ -168,9 +215,31 @@ export class DustScene {
       return;
     }
 
-    if (roomImg && personImg && roomImg.naturalWidth && personImg.naturalWidth) {
-      drawCover(roomCtx, roomImg, roomImg.naturalWidth, roomImg.naturalHeight, w, h);
-      drawCover(perCtx, personImg, personImg.naturalWidth, personImg.naturalHeight, w, h);
+    roomCtx.clearRect(0, 0, w, h);
+    perCtx.clearRect(0, 0, w, h);
+
+    if (
+      roomImg &&
+      personImg &&
+      roomImg.naturalWidth &&
+      personImg.naturalWidth
+    ) {
+      drawCover(
+        roomCtx,
+        roomImg,
+        roomImg.naturalWidth,
+        roomImg.naturalHeight,
+        w,
+        h,
+      );
+      drawCover(
+        perCtx,
+        personImg,
+        personImg.naturalWidth,
+        personImg.naturalHeight,
+        w,
+        h,
+      );
       this.status = "ready";
     } else {
       this.paintFallbackRoom(roomCtx);
@@ -178,10 +247,9 @@ export class DustScene {
       this.status = "fallback";
     }
 
-    // soft alpha mask for the figure
-    const mask = makeCanvas(w, h);
-    const mctx = mask.getContext("2d");
+    const mctx = this.maskCanvas.getContext("2d");
     if (!mctx) return;
+    mctx.clearRect(0, 0, w, h);
     mctx.fillStyle = "#000";
     mctx.strokeStyle = "#000";
     mctx.filter = "blur(19px)";
@@ -189,72 +257,215 @@ export class DustScene {
     mctx.filter = "none";
 
     perCtx.globalCompositeOperation = "destination-in";
-    perCtx.drawImage(mask, 0, 0);
+    perCtx.drawImage(this.maskCanvas, 0, 0);
     perCtx.globalCompositeOperation = "source-over";
 
-    // ---- sample particles from the figure's own pixels -----------------
+    this.populateParticlesAndErosion(mctx, perCtx, maxParticles);
+  }
+
+  /**
+   * Captures the current live camera video frame + reconstructed background plate
+   * right as a vanish transition begins so the user's real live appearance dissolves!
+   */
+  buildFromLiveVideo(
+    videoEl: HTMLVideoElement,
+    plateImageData: ImageData | null,
+    foregroundAlpha: Float32Array | null,
+    options: { mirrored?: boolean; maxParticles?: number } = {},
+  ) {
+    const { w, h } = this;
+    const roomCtx = this.room.getContext("2d");
+    const perCtx = this.person.getContext("2d");
+    const mctx = this.maskCanvas.getContext("2d");
+    if (!roomCtx || !perCtx || !mctx) return;
+
+    const vw = videoEl.videoWidth || 1280;
+    const vh = videoEl.videoHeight || 720;
+
+    // 1. Draw background plate
+    if (plateImageData) {
+      const tmp = makeCanvas(plateImageData.width, plateImageData.height);
+      tmp.getContext("2d")?.putImageData(plateImageData, 0, 0);
+      drawCover(
+        roomCtx,
+        tmp,
+        plateImageData.width,
+        plateImageData.height,
+        w,
+        h,
+        Boolean(options.mirrored),
+      );
+    } else {
+      this.paintFallbackRoom(roomCtx);
+    }
+
+    // 2. Draw current live person frame
+    perCtx.clearRect(0, 0, w, h);
+    drawCover(perCtx, videoEl, vw, vh, w, h, Boolean(options.mirrored));
+
+    // 3. Apply foreground matte or soft silhouette mask
+    mctx.clearRect(0, 0, w, h);
+    if (
+      foregroundAlpha &&
+      plateImageData &&
+      foregroundAlpha.length === plateImageData.width * plateImageData.height
+    ) {
+      const mw = plateImageData.width;
+      const mh = plateImageData.height;
+      const alphaCanvas = makeCanvas(mw, mh);
+      const actx = alphaCanvas.getContext("2d");
+      if (actx) {
+        const maskImg = actx.createImageData(mw, mh);
+        for (let i = 0; i < foregroundAlpha.length; i++) {
+          const p4 = i * 4;
+          maskImg.data[p4] = 0;
+          maskImg.data[p4 + 1] = 0;
+          maskImg.data[p4 + 2] = 0;
+          maskImg.data[p4 + 3] = Math.round(
+            Math.max(0, Math.min(1, foregroundAlpha[i])) * 255,
+          );
+        }
+        actx.putImageData(maskImg, 0, 0);
+        mctx.filter = "blur(8px)";
+        drawCover(
+          mctx,
+          alphaCanvas,
+          mw,
+          mh,
+          w,
+          h,
+          Boolean(options.mirrored),
+        );
+        mctx.filter = "none";
+      }
+    } else {
+      mctx.fillStyle = "#000";
+      mctx.strokeStyle = "#000";
+      mctx.filter = "blur(18px)";
+      silhouette(mctx, w, h);
+      mctx.filter = "none";
+    }
+
+    perCtx.globalCompositeOperation = "destination-in";
+    perCtx.drawImage(this.maskCanvas, 0, 0);
+    perCtx.globalCompositeOperation = "source-over";
+
+    this.status = "live-camera";
+    this.populateParticlesAndErosion(
+      mctx,
+      perCtx,
+      options.maxParticles ?? 22000,
+    );
+  }
+
+  private acquirePooledParticle(index: number): Particle {
+    let p = this.particlePool[index];
+    if (!p) {
+      p = {
+        x: 0,
+        y: 0,
+        delay: 0,
+        seed: 0,
+        size: 2,
+        power: 1,
+        depth: 1,
+        angle: 0,
+        spin: 0,
+        isFragment: false,
+        r: 200,
+        g: 180,
+        b: 160,
+      };
+      this.particlePool[index] = p;
+    }
+    return p;
+  }
+
+  private populateParticlesAndErosion(
+    mctx: CanvasRenderingContext2D,
+    perCtx: CanvasRenderingContext2D,
+    maxParticles: number,
+  ) {
+    const { w, h } = this;
     const mdata = mctx.getImageData(0, 0, w, h).data;
     const pdata = perCtx.getImageData(0, 0, w, h).data;
     const step = 3;
-    const found: Particle[] = [];
+    let count = 0;
+
     for (let y = 0; y < h; y += step) {
       for (let x = 0; x < w; x += step) {
         const i = (y * w + x) * 4;
-        if (mdata[i + 3] < 110) continue;
-        const a = pdata[i + 3];
-        if (a < 40) continue;
-        found.push({
-          x,
-          y,
-          delay: 0,
-          seed: Math.random(),
-          size: 1.4 + Math.random() * 2.2,
-          power: 0.55 + Math.random() * 0.9,
-          r: pdata[i],
-          g: pdata[i + 1],
-          b: pdata[i + 2],
-        });
+        if (mdata[i + 3] < 105) continue;
+        if (pdata[i + 3] < 40) continue;
+
+        const seed = Math.random();
+        const isFragment = seed > 0.88; // ~12% larger rotating polygon fragments
+        const p = this.acquirePooledParticle(count);
+        p.x = x;
+        p.y = y;
+        p.delay = 0;
+        p.seed = seed;
+        p.isFragment = isFragment;
+        p.depth = 0.42 + ((seed * 13.37) % 1) * 1.03;
+        p.size = isFragment
+          ? 3.8 + (seed - 0.88) * 38
+          : 1.2 + seed * 2.1;
+        p.power = (0.52 + ((seed * 7.91) % 1) * 0.92) * (0.75 + p.depth * 0.3);
+        p.angle = seed * Math.PI * 2;
+        p.spin = ((seed - 0.5) * 9.5) * (isFragment ? 1.4 : 0.5);
+        p.r = pdata[i];
+        p.g = pdata[i + 1];
+        p.b = pdata[i + 2];
+        count += 1;
       }
     }
 
-    // dissolve spreads outward from the raised hand
+    // Cap particle pool length for laptop GPU/CPU efficiency using reservoir-like shuffle
+    const cap = Math.max(2000, Math.min(28000, maxParticles));
+    if (count > cap) {
+      for (let i = count - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const tmp = this.particlePool[i];
+        this.particlePool[i] = this.particlePool[j];
+        this.particlePool[j] = tmp;
+      }
+      count = cap;
+    }
+    this.activePoolLength = count;
+    this.lastActiveParticles = count;
+
+    // Dissolve wave radiates outward from raised snapping hand
     const ox = 0.795 * w;
     const oy = 0.4 * h;
     let maxD = 1;
-    for (const p of found) {
+    for (let idx = 0; idx < count; idx++) {
+      const p = this.particlePool[idx];
       const d = Math.hypot(p.x - ox, p.y - oy);
-      maxD = Math.max(maxD, d);
+      if (d > maxD) maxD = d;
     }
-    for (const p of found) {
+    for (let idx = 0; idx < count; idx++) {
+      const p = this.particlePool[idx];
       const d = Math.hypot(p.x - ox, p.y - oy) / maxD;
-      p.delay = Math.min(0.86, d * 0.62 + p.seed * 0.26);
+      p.delay = Math.min(0.85, d * 0.61 + p.seed * 0.25);
     }
 
-    // keep the run light enough for 60fps on integrated graphics
-    const MAX = 22000;
-    if (found.length > MAX) {
-      for (let i = found.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [found[i], found[j]] = [found[j], found[i]];
-      }
-      found.length = MAX;
-    }
-    this.particles = found;
-    this.lastActiveParticles = found.length;
-
-    // ---- pre-render the erosion stages --------------------------------
-    this.erode = [];
+    // Pre-render reusable erosion stages without allocating new DOM canvases
     const ew = Math.round(w * ERODE_SCALE);
     const eh = Math.round(h * ERODE_SCALE);
-    const acc = makeCanvas(ew, eh);
-    const accCtx = acc.getContext("2d");
+    const accCtx = this.erodeAcc.getContext("2d");
     if (!accCtx) return;
+    accCtx.clearRect(0, 0, ew, eh);
+
     for (let s = 0; s < STAGES; s++) {
       const threshold = (s + 1) / STAGES;
-      for (const p of this.particles) {
+      for (let idx = 0; idx < count; idx++) {
+        const p = this.particlePool[idx];
         if (p.delay < threshold && p.delay >= threshold - 1 / STAGES) {
-          const r = (7 + p.size * 4.6) * ERODE_SCALE * (1.15 + p.seed * 0.5);
-          accCtx.globalAlpha = 0.85;
+          const r =
+            (7 + Math.min(4.2, p.size) * 4.5) *
+            ERODE_SCALE *
+            (1.15 + p.seed * 0.5);
+          accCtx.globalAlpha = 0.86;
           accCtx.drawImage(
             this.blob,
             p.x * ERODE_SCALE - r,
@@ -265,19 +476,21 @@ export class DustScene {
         }
       }
       accCtx.globalAlpha = 1;
-      const stage = makeCanvas(ew, eh);
-      stage.getContext("2d")?.drawImage(acc, 0, 0);
-      this.erode.push(stage);
+      const stageCtx = this.erode[s]?.getContext("2d");
+      if (stageCtx) {
+        stageCtx.clearRect(0, 0, ew, eh);
+        stageCtx.drawImage(this.erodeAcc, 0, 0);
+      }
     }
   }
 
   get particleCount(): number {
-    return this.lastActiveParticles || this.particles.length;
+    return this.lastActiveParticles || this.activePoolLength;
   }
 
   /**
-   * t = 0 → person whole, t = 1 → fully vanished.
-   * Safe to run in either direction (vanishing 0->1 or reassembly 1->0).
+   * t = 0 → live camera / whole person, t = 1 → fully vanished onto clean plate.
+   * Deterministic in both directions (vanish 0->1 and reassembly 1->0).
    */
   render(
     ctx: CanvasRenderingContext2D,
@@ -294,6 +507,7 @@ export class DustScene {
       0.5,
       Math.min(3.0, options.particleSize ?? 1.0),
     );
+    const smoothness = options.motionSmoothness ?? 70;
     const lowPower = Boolean(options.lowPowerMode);
     const rawDensity = Math.max(20, Math.min(100, options.density ?? 80));
     const effectiveDensity = lowPower ? Math.min(35, rawDensity) : rawDensity;
@@ -303,12 +517,37 @@ export class DustScene {
     try {
       ctx.save();
       ctx.clearRect(0, 0, w, h);
+
+      // When t <= 0.001 and a live camera stream is active, render the real live camera feed directly!
+      const liveVid = options.liveVideoSource;
+      if (
+        tt <= 0.001 &&
+        liveVid &&
+        liveVid.readyState >= 2 &&
+        liveVid.videoWidth > 0
+      ) {
+        drawCover(
+          ctx,
+          liveVid,
+          liveVid.videoWidth,
+          liveVid.videoHeight,
+          w,
+          h,
+          Boolean(options.mirrorLiveVideo),
+        );
+        this.lastActiveParticles = Math.round(
+          this.activePoolLength * (effectiveDensity / 100),
+        );
+        ctx.restore();
+        return;
+      }
+
       ctx.drawImage(this.room, 0, 0);
 
       if (tt <= 0.001) {
         ctx.drawImage(this.person, 0, 0);
         this.lastActiveParticles = Math.round(
-          this.particles.length * (effectiveDensity / 100),
+          this.activePoolLength * (effectiveDensity / 100),
         );
         ctx.restore();
         return;
@@ -322,7 +561,7 @@ export class DustScene {
 
       switch (effect) {
         case "fade-out":
-          this.renderFadeOut(ctx, tt, accent, intensity);
+          this.renderFadeOut(ctx, tt, accent, intensity, smoothness);
           break;
         case "digital-glitch":
           this.renderDigitalGlitch(ctx, tt, dir, accent, intensity, lowPower);
@@ -338,6 +577,7 @@ export class DustScene {
             effectiveDensity,
             accent,
             intensity,
+            smoothness,
           );
           break;
         case "light-burst":
@@ -351,12 +591,12 @@ export class DustScene {
             effectiveDensity,
             accent,
             intensity,
+            smoothness,
             lowPower,
           );
           break;
-        case "dust":
-        default:
-          this.renderDustParticles(
+        case "cinematic-disintegration":
+          this.renderDustAndFragments(
             ctx,
             tt,
             dir,
@@ -366,13 +606,47 @@ export class DustScene {
             effectiveDensity,
             accent,
             intensity,
+            smoothness,
             lowPower,
+            "cinematic",
+          );
+          break;
+        case "fine-particles":
+          this.renderDustAndFragments(
+            ctx,
+            tt,
+            dir,
+            duration,
+            speed,
+            particleSizeMult * 0.72,
+            effectiveDensity,
+            accent,
+            intensity,
+            smoothness,
+            lowPower,
+            "fine",
+          );
+          break;
+        case "dust":
+        default:
+          this.renderDustAndFragments(
+            ctx,
+            tt,
+            dir,
+            duration,
+            speed,
+            particleSizeMult,
+            effectiveDensity,
+            accent,
+            intensity,
+            smoothness,
+            lowPower,
+            "classic",
           );
           break;
       }
       ctx.restore();
     } catch (err) {
-      // Graceful fallback if any effect rendering fails
       this.lastFallbackReason =
         err instanceof Error ? err.message : "effect-render-error";
       ctx.restore();
@@ -402,7 +676,7 @@ export class DustScene {
     ctx.drawImage(this.scratch, 0, 0);
   }
 
-  private renderDustParticles(
+  private renderDustAndFragments(
     ctx: CanvasRenderingContext2D,
     tt: number,
     dir: Direction,
@@ -412,77 +686,123 @@ export class DustScene {
     effectiveDensity: number,
     accent: { r: number; g: number; b: number },
     intensity: number,
+    smoothness: number,
     lowPower: boolean,
+    variant: "classic" | "cinematic" | "fine",
   ) {
     const { w, h } = this;
     this.drawErodedPerson(ctx, tt);
 
     const wind = windFor(dir);
     const spread =
-      620 * Math.pow(duration / 1.8, 0.45) * speed * (0.65 + intensity * 0.55);
-    const total = this.particles.length;
+      640 * Math.pow(duration / 1.8, 0.45) * speed * (0.65 + intensity * 0.55);
+    const total = this.activePoolLength;
+    if (total === 0) return;
     const maxCount = Math.max(1, Math.floor(total * (effectiveDensity / 100)));
     const stride = Math.max(1, Math.round(total / maxCount));
     this.lastActiveParticles = Math.floor(total / stride);
 
     for (let i = 0; i < total; i += stride) {
-      const p = this.particles[i];
+      const p = this.particlePool[i];
       if (tt <= p.delay) continue;
       const local = Math.min(1, (tt - p.delay) / (1 - p.delay + 0.0001));
-      const e = Math.pow(local, 1.22);
+      const e = evaluateMotionCurve(local, smoothness);
+      const depthScale = 0.65 + p.depth * 0.55;
       const nx = p.x - w / 2;
       const ny = p.y - h / 2;
 
       let dx: number;
       let dy: number;
       if (dir === "toward") {
-        const k = 1 + e * 1.35 * speed;
-        dx = nx * (k - 1) + Math.sin(p.seed * 9.1 + local * 3.4) * 30 * e;
-        dy = ny * (k - 1) + Math.cos(p.seed * 7.7 + local * 2.8) * 22 * e;
-      } else {
+        const k = 1 + e * 1.45 * speed * depthScale;
         dx =
-          wind.x * e * spread * p.power +
-          Math.sin(p.seed * 9.1 + local * 3.4 + p.y * 0.012) * 34 * e;
+          nx * (k - 1) +
+          Math.sin(p.seed * 9.1 + local * 3.6) * 34 * e * depthScale;
+        dy =
+          ny * (k - 1) +
+          Math.cos(p.seed * 7.7 + local * 2.9) * 25 * e * depthScale;
+      } else {
+        const curlX =
+          Math.sin(p.seed * 9.1 + local * 3.8 + p.y * 0.012) * 38 +
+          Math.cos(p.seed * 17.3 + local * 6.2) * 14;
+        const curlY =
+          Math.cos(p.seed * 7.7 + local * 3.1 + p.x * 0.01) * 28 -
+          (variant === "fine" ? 45 : 0);
+        dx = wind.x * e * spread * p.power + curlX * e * depthScale;
         dy =
           wind.y * e * spread * p.power +
-          e * e * 150 * (dir === "up" ? -0.2 : 1) +
-          Math.cos(p.seed * 7.7 + local * 2.8 + p.x * 0.01) * 24 * e;
+          e * e * (variant === "fine" ? -65 : 135) * (dir === "up" ? -0.25 : 1) +
+          curlY * e * depthScale;
       }
 
       const x = p.x + dx;
       const y = p.y + dy;
-      let alpha = Math.pow(1 - local, 1.15);
-      alpha *= Math.min(1, local * 16);
-      if (alpha <= 0.012) continue;
+      let alpha = Math.pow(1 - local, 1.18) * Math.min(1, local * 15);
+      // Far depth plane is subtly softer for atmospheric depth perception
+      alpha *= 0.62 + Math.min(0.38, p.depth * 0.3);
+      if (alpha <= 0.014) continue;
 
-      const size = p.size * particleSizeMult * (1 - local * 0.42);
-      const heat = Math.max(0, 1 - local * 3.1) * intensity;
+      const heat = Math.max(0, 1 - local * 2.9) * intensity;
       const r = Math.round(
         p.r +
-          (accent.r - p.r) * heat * 0.85 +
-          (196 - p.r) * (1 - heat) * 0.35,
+          (accent.r - p.r) * heat * 0.86 +
+          (192 - p.r) * (1 - heat) * 0.32,
       );
       const g = Math.round(
         p.g +
-          (accent.g - p.g) * heat * 0.85 +
-          (185 - p.g) * (1 - heat) * 0.35,
+          (accent.g - p.g) * heat * 0.86 +
+          (180 - p.g) * (1 - heat) * 0.32,
       );
       const b = Math.round(
         p.b +
-          (accent.b - p.b) * heat * 0.85 +
-          (172 - p.b) * (1 - heat) * 0.35,
+          (accent.b - p.b) * heat * 0.86 +
+          (168 - p.b) * (1 - heat) * 0.32,
       );
 
-      ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
-      ctx.fillRect(x, y, size, size);
-      if (!lowPower) {
-        ctx.fillStyle = `rgba(${r},${g},${b},${alpha * 0.3})`;
-        ctx.fillRect(
-          x - dx * 0.055,
-          y - dy * 0.055,
-          size * 0.82,
-          size * 0.82,
-        );
+      const useShard =
+        variant !== "fine" &&
+        p.isFragment &&
+        (variant === "cinematic" || p.seed > 0.94);
+
+      if (useShard && !lowPower) {
+        // Rotating irregular shard fragment
+        const shardSize =
+          p.size *
+          particleSizeMult *
+          depthScale *
+          (variant === "cinematic" ? 1.25 : 0.95) *
+          (1 - local * 0.48);
+        const theta = p.angle + local * p.spin;
+        const c = Math.cos(theta) * shardSize;
+        const s = Math.sin(theta) * shardSize;
+
+        ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+        ctx.beginPath();
+        ctx.moveTo(x + c, y + s);
+        ctx.lineTo(x - s * 0.72, y + c * 0.72);
+        ctx.lineTo(x - c * 0.85, y - s * 0.85);
+        ctx.lineTo(x + s * 0.55, y - c * 0.55);
+        ctx.closePath();
+        ctx.fill();
+      } else {
+        // Fine ash / ember grain with depth-scaled size
+        const size =
+          Math.min(3.4, p.size) *
+          particleSizeMult *
+          (0.75 + p.depth * 0.35) *
+          (1 - local * 0.4);
+        ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+        ctx.fillRect(x, y, size, size);
+
+        if (!lowPower && p.depth > 0.95) {
+          ctx.fillStyle = `rgba(${r},${g},${b},${alpha * 0.28})`;
+          ctx.fillRect(
+            x - dx * 0.05,
+            y - dy * 0.05,
+            size * 0.8,
+            size * 0.8,
+          );
+        }
       }
     }
   }
@@ -497,27 +817,24 @@ export class DustScene {
     effectiveDensity: number,
     accent: { r: number; g: number; b: number },
     intensity: number,
+    smoothness: number,
   ) {
     this.drawErodedPerson(ctx, tt);
     const wind = windFor(dir);
-    const total = this.particles.length;
-    // Sample fewer, larger mosaic blocks
-    const blockStride = Math.max(
-      4,
-      Math.round(18 / (effectiveDensity / 60)),
-    );
+    const total = this.activePoolLength;
+    const blockStride = Math.max(4, Math.round(18 / (effectiveDensity / 60)));
     this.lastActiveParticles = Math.floor(total / blockStride);
     const spread = 480 * speed * (duration / 1.8) * (0.6 + intensity * 0.5);
     const baseTileSize = Math.max(5, Math.round(9 * particleSizeMult));
 
     for (let i = 0; i < total; i += blockStride) {
-      const p = this.particles[i];
+      const p = this.particlePool[i];
       if (tt <= p.delay) continue;
       const local = Math.min(1, (tt - p.delay) / (1 - p.delay + 0.0001));
       const snapGridX = Math.round(p.x / baseTileSize) * baseTileSize;
       const snapGridY = Math.round(p.y / baseTileSize) * baseTileSize;
 
-      const stepE = Math.floor(local * 12) / 12;
+      const stepE = evaluateMotionCurve(local, smoothness);
       const dx =
         (dir === "toward" ? (p.x - this.w / 2) * 0.9 : wind.x * spread) *
         stepE *
@@ -572,20 +889,13 @@ export class DustScene {
 
       ctx.save();
       ctx.globalAlpha = alpha;
-      ctx.drawImage(
-        this.person,
-        0,
-        sy,
-        w,
-        sliceH,
-        jitter,
-        sy,
-        w,
-        sliceH,
-      );
+      ctx.drawImage(this.person, 0, sy, w, sliceH, jitter, sy, w, sliceH);
 
-      // Chromatic aberration bar on active glitch slices
-      if (sliceProgress > 0.05 && sliceProgress < 0.85 && Math.abs(pseudoRand) > 0.35) {
+      if (
+        sliceProgress > 0.05 &&
+        sliceProgress < 0.85 &&
+        Math.abs(pseudoRand) > 0.35
+      ) {
         ctx.fillStyle = `rgba(${accent.r},${accent.g},${accent.b},${0.28 * alpha * intensity})`;
         ctx.fillRect(
           w * 0.25 + jitter * 1.3,
@@ -603,20 +913,19 @@ export class DustScene {
     tt: number,
     accent: { r: number; g: number; b: number },
     intensity: number,
+    smoothness: number,
   ) {
     const { w, h } = this;
     this.lastActiveParticles = 0;
-    // Smoothstep optical curve
-    const smooth = tt * tt * (3 - 2 * tt);
-    const alpha = Math.max(0, 1 - smooth);
+    const eased = evaluateMotionCurve(tt, smoothness);
+    const alpha = Math.max(0, 1 - eased);
 
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.drawImage(this.person, 0, 0);
     ctx.restore();
 
-    // Subtle optical tint pulse at mid-dissolve
-    const midPulse = Math.sin(tt * Math.PI) * 0.18 * intensity;
+    const midPulse = Math.sin(tt * Math.PI) * 0.16 * intensity;
     if (midPulse > 0.01) {
       ctx.save();
       const grad = ctx.createRadialGradient(
@@ -648,30 +957,29 @@ export class DustScene {
     effectiveDensity: number,
     accent: { r: number; g: number; b: number },
     intensity: number,
+    smoothness: number,
     lowPower: boolean,
   ) {
     const { w, h } = this;
     this.drawErodedPerson(ctx, tt);
 
-    // Photonic core bloom centered near the snapping hand / upper torso
     const flash = Math.sin(Math.pow(tt, 0.75) * Math.PI) * intensity;
     if (flash > 0.02) {
       const cx = w * 0.58;
       const cy = h * 0.42;
       const radius = w * (0.18 + tt * 0.55);
       const g = ctx.createRadialGradient(cx, cy, 4, cx, cy, radius);
-      g.addColorStop(0, `rgba(255,255,255,${Math.min(0.85, flash * 0.9)})`);
+      g.addColorStop(0, `rgba(255,250,240,${Math.min(0.85, flash * 0.88)})`);
       g.addColorStop(
         0.35,
-        `rgba(${accent.r},${accent.g},${accent.b},${flash * 0.55})`,
+        `rgba(${accent.r},${accent.g},${accent.b},${flash * 0.52})`,
       );
       g.addColorStop(1, "rgba(0,0,0,0)");
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, w, h);
     }
 
-    // Luminous bokeh motes
-    const total = this.particles.length;
+    const total = this.activePoolLength;
     const stride = Math.max(
       8,
       Math.round((lowPower ? 45 : 22) / (effectiveDensity / 80)),
@@ -681,49 +989,52 @@ export class DustScene {
     const spread = 540 * speed * (duration / 1.8);
 
     for (let i = 0; i < total; i += stride) {
-      const p = this.particles[i];
+      const p = this.particlePool[i];
       if (tt <= p.delay) continue;
       const local = Math.min(1, (tt - p.delay) / (1 - p.delay + 0.0001));
+      const eased = evaluateMotionCurve(local, smoothness);
       const rx = p.x - w * 0.54;
       const ry = p.y - h * 0.45;
       const radialDist = Math.hypot(rx, ry) || 1;
       const ux = rx / radialDist + wind.x * 0.45;
       const uy = ry / radialDist + wind.y * 0.45;
 
-      const x = p.x + ux * local * spread * p.power;
-      const y = p.y + uy * local * spread * p.power;
-      const alpha = Math.sin(local * Math.PI) * intensity;
+      const x = p.x + ux * eased * spread * p.power;
+      const y = p.y + uy * eased * spread * p.power;
+      const alpha = Math.sin(local * Math.PI) * intensity * (0.6 + p.depth * 0.3);
       if (alpha <= 0.02) continue;
 
-      const radius = (2.2 + p.size * 1.8) * particleSizeMult * (1 - local * 0.3);
-      ctx.fillStyle = `rgba(${ Math.min(255, accent.r + 50) },${ Math.min(255, accent.g + 50) },${ Math.min(255, accent.b + 50) },${alpha})`;
+      const radius =
+        (2.0 + Math.min(3.5, p.size) * 1.6) *
+        particleSizeMult *
+        (1 - local * 0.32);
+      ctx.fillStyle = `rgba(${Math.min(255, accent.r + 50)},${Math.min(255, accent.g + 50)},${Math.min(255, accent.b + 50)},${alpha})`;
       ctx.beginPath();
       ctx.arc(x, y, radius, 0, Math.PI * 2);
       ctx.fill();
     }
   }
 
-  // ---- procedural fallback so a missing asset never leaves a hole --------
   private paintFallbackRoom(ctx: CanvasRenderingContext2D) {
     const { w, h } = this;
     const g = ctx.createLinearGradient(0, 0, w, h);
-    g.addColorStop(0, "#c9b79c");
-    g.addColorStop(0.55, "#a98f72");
-    g.addColorStop(1, "#6d5741");
+    g.addColorStop(0, "#1c1917");
+    g.addColorStop(0.55, "#151311");
+    g.addColorStop(1, "#0c0a09");
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, w, h);
-    ctx.fillStyle = "rgba(255,236,205,0.22)";
-    ctx.fillRect(0, 0, w * 0.32, h);
-    ctx.fillStyle = "rgba(60,44,30,0.32)";
-    ctx.fillRect(w * 0.72, h * 0.18, w * 0.22, h * 0.62);
-    ctx.fillStyle = "rgba(38,28,19,0.5)";
+    ctx.fillStyle = "rgba(240, 98, 58, 0.06)";
+    ctx.fillRect(0, 0, w * 0.35, h);
+    ctx.fillStyle = "rgba(255, 255, 255, 0.03)";
+    ctx.fillRect(w * 0.7, h * 0.16, w * 0.22, h * 0.62);
+    ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
     ctx.fillRect(0, h * 0.82, w, h * 0.18);
   }
 
   private paintFallbackPerson(ctx: CanvasRenderingContext2D) {
     const { w, h } = this;
     this.paintFallbackRoom(ctx);
-    ctx.fillStyle = "#2c2620";
+    ctx.fillStyle = "#292524";
     ctx.beginPath();
     ctx.ellipse(w * 0.5, h * 0.3, w * 0.098, h * 0.142, 0, 0, Math.PI * 2);
     ctx.fill();
@@ -733,7 +1044,7 @@ export class DustScene {
     ctx.quadraticCurveTo(w * 0.68, h * 0.5, w * 0.7, h * 1.05);
     ctx.closePath();
     ctx.fill();
-    ctx.fillStyle = "#5b4b3c";
+    ctx.fillStyle = "#44403c";
     ctx.fillRect(w * 0.4, h * 0.52, w * 0.2, h * 0.53);
   }
 }

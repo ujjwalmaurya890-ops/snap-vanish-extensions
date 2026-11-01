@@ -1,54 +1,100 @@
 {
   "manifest_version": 3,
-  "name": "Snap Vanish",
+  "name": "Snap Vanish — Local Hand Snap Disintegration",
+  "short_name": "Snap Vanish",
   "version": "2.0.0",
-  "description": "Snap your fingers on camera and dissolve with reversible particle effects. Local processing, configurable studio presets, and emergency restore.",
   "minimum_chrome_version": "121",
-  "permissions": ["activeTab", "storage"],
-  "host_permissions": [
-    "https://meet.google.com/*",
-    "https://teams.microsoft.com/*",
-    "https://*.zoom.us/*"
-  ],
-  "background": {
-    "service_worker": "background.js"
+  "description": "Snap your fingers to disintegrate into warm ember dust on video calls. 21-point local hand AI, acoustic confirmation, zero cloud uploads.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
   },
   "action": {
-    "default_title": "Snap Vanish Studio",
-    "default_popup": "popup/popup.html"
-  },
-  "commands": {
-    "toggle-snap": {
-      "suggested_key": { "default": "Alt+Shift+S" },
-      "description": "Toggle the snap (vanish / return)"
-    },
-    "vanish-now": {
-      "suggested_key": { "default": "Alt+Shift+D" },
-      "description": "Vanish immediately, bypassing gesture detection"
-    },
-    "mute-only": {
-      "suggested_key": { "default": "Alt+Shift+M" },
-      "description": "Mute or unmute without vanishing"
-    },
-    "reset-frame": {
-      "suggested_key": { "default": "Alt+Shift+R" },
-      "description": "Emergency restore to the live camera feed"
+    "default_title": "Snap Vanish 2.0",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png"
     }
+  },
+  "options_page": "studio/index.html",
+  "permissions": ["activeTab", "storage"],
+  "background": {
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {
       "matches": [
         "https://meet.google.com/*",
         "https://teams.microsoft.com/*",
-        "https://*.zoom.us/*"
+        "https://teams.live.com/*",
+        "https://*.zoom.us/wc/*",
+        "https://app.zoom.us/wc/*"
+      ],
+      "js": ["content/main-world-bridge.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://meet.google.com/*",
+        "https://teams.microsoft.com/*",
+        "https://teams.live.com/*",
+        "https://*.zoom.us/wc/*",
+        "https://app.zoom.us/wc/*"
       ],
       "js": ["content/snap-vanish.js"],
       "css": ["content/snap-vanish.css"],
       "run_at": "document_idle",
-      "all_frames": false
+      "world": "ISOLATED"
     }
   ],
+  "web_accessible_resources": [
+    {
+      "resources": ["models/*", "wasm/*", "vendor/*"],
+      "matches": [
+        "https://meet.google.com/*",
+        "https://teams.microsoft.com/*",
+        "https://teams.live.com/*",
+        "https://*.zoom.us/wc/*",
+        "https://app.zoom.us/wc/*"
+      ]
+    }
+  ],
+  "commands": {
+    "toggle-snap": {
+      "suggested_key": {
+        "default": "Alt+Shift+S",
+        "mac": "Alt+Shift+S"
+      },
+      "description": "Enable or pause Snap Vanish"
+    },
+    "vanish-now": {
+      "suggested_key": {
+        "default": "Alt+Shift+D",
+        "mac": "Alt+Shift+D"
+      },
+      "description": "Trigger vanish or return transition immediately"
+    },
+    "mute-only": {
+      "suggested_key": {
+        "default": "Alt+Shift+M",
+        "mac": "Alt+Shift+M"
+      },
+      "description": "Toggle microphone mute without vanishing"
+    },
+    "emergency-restore": {
+      "suggested_key": {
+        "default": "Alt+Shift+R",
+        "mac": "Alt+Shift+R"
+      },
+      "description": "Emergency restore live camera feed and unmute microphone"
+    }
+  },
   "content_security_policy": {
-    "extension_pages": "script-src 'self' wasm-unsafe-eval; object-src 'self'"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
   }
 }

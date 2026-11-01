@@ -1,246 +1,218 @@
-/* Snap Vanish v2.0.0 — Popup Controller */
-
-const $ = (id) => document.getElementById(id);
-
-const MODE_PRESETS = {
-  professional: {
-    effect: "fade-out",
-    duration: 1.2,
-    sensitivity: 78,
-    density: 55,
-    sound: false,
-    lowPowerMode: false,
-  },
-  creative: {
-    effect: "dust",
-    duration: 1.8,
-    sensitivity: 62,
-    density: 85,
-    sound: true,
-    lowPowerMode: false,
-  },
-  minimal: {
-    effect: "fade-out",
-    duration: 0.8,
-    sensitivity: 72,
-    density: 35,
-    sound: false,
-    lowPowerMode: false,
-  },
-  "low-power": {
-    effect: "pixel-dissolve",
-    duration: 1.1,
-    sensitivity: 68,
-    density: 30,
-    sound: false,
-    lowPowerMode: true,
-  },
-};
-
-const state = {
-  enabled: true,
-  sensitivity: 62,
-  duration: 1.8,
-  direction: "right",
-  sound: true,
-  effect: "dust",
-  density: 80,
-  lowPowerMode: false,
-  meetingMode: "creative",
-  engineState: "live",
-  muted: false,
-};
-
-function paint() {
-  $("enabled").setAttribute("aria-checked", String(state.enabled));
-  $("sensitivity").value = String(state.sensitivity);
-  $("sensitivity-out").textContent = String(state.sensitivity);
-  $("duration").value = String(state.duration);
-  $("duration-out").textContent = `${Number(state.duration).toFixed(1)} s`;
-  $("density").value = String(state.density);
-  $("density-out").textContent = `${state.density}%`;
-  $("effect").value = state.effect || "dust";
-  $("meetingMode").value = state.meetingMode || "creative";
-  $("sound").checked = Boolean(state.sound);
-  $("lowPowerMode").checked = Boolean(state.lowPowerMode);
-
-  const badge = $("state-badge");
-  const st = state.engineState || "live";
-  badge.textContent = st.toUpperCase();
-  badge.setAttribute("data-state", st);
-
-  $("snap-label").textContent =
-    st === "vanished"
-      ? "Restore Camera"
-      : st === "vanishing" || st === "restoring"
-        ? "Transitioning..."
-        : "Vanish Now";
-
-  document.querySelectorAll("#direction button").forEach((b) => {
-    const on = b.dataset.dir === state.direction;
-    b.classList.toggle("on", on);
-    b.setAttribute("aria-checked", String(on));
-  });
-
-  const disabled = !state.enabled;
-  [
-    "snap",
-    "sensitivity",
-    "duration",
-    "density",
-    "effect",
-    "meetingMode",
-    "sound",
-    "lowPowerMode",
-  ].forEach((id) => {
-    const el = $(id);
-    if (el) el.disabled = disabled;
-  });
-  document.querySelectorAll("#direction button").forEach((b) => {
-    b.disabled = disabled;
-  });
-
-  $("mic-dot").classList.toggle("muted", Boolean(state.muted));
-  $("mic-label").textContent = state.muted ? "Mic muted" : "Mic live";
-}
-
-async function persist() {
-  try {
-    await chrome.storage.sync.set({
-      enabled: state.enabled,
-      sensitivity: state.sensitivity,
-      duration: state.duration,
-      direction: state.direction,
-      sound: state.sound,
-      effect: state.effect,
-      density: state.density,
-      lowPowerMode: state.lowPowerMode,
-      meetingMode: state.meetingMode,
-    });
-  } catch {
-    // Ignore storage error
-  }
-  chrome.runtime.sendMessage(
-    { type: "SETTINGS_CHANGED", payload: state },
-    (res) => {
-      if (chrome.runtime.lastError || !res?.ok) {
-        return;
-      }
+/**
+ * Snap Vanish 2.0 — Compact Chrome Toolbar Popup Controller
+ */
+(() => {
+  const PRESET_CONFIGS = {
+    dust: { effect: "dust", duration: 1.8, density: 80, direction: "right", colorAccent: "#e0532c" },
+    "cinematic-disintegration": {
+      effect: "cinematic-disintegration",
+      duration: 2.2,
+      density: 92,
+      direction: "right",
+      colorAccent: "#f0623a",
     },
-  );
-}
+    "fine-particles": {
+      effect: "fine-particles",
+      duration: 1.7,
+      density: 95,
+      direction: "up",
+      colorAccent: "#e5e7eb",
+    },
+    "light-burst": {
+      effect: "light-burst",
+      duration: 1.5,
+      density: 85,
+      direction: "toward",
+      colorAccent: "#f59e0b",
+    },
+    "fade-out": {
+      effect: "fade-out",
+      duration: 1.2,
+      density: 55,
+      direction: "up",
+      colorAccent: "#d97706",
+    },
+    "reverse-assembly": {
+      effect: "dust",
+      duration: 1.8,
+      density: 84,
+      direction: "left",
+      colorAccent: "#10b981",
+    },
+  };
 
-function refreshTabState() {
-  chrome.runtime.sendMessage({ type: "GET_STATE" }, (res) => {
-    if (chrome.runtime.lastError || !res || !res.ok) {
-      $("host").textContent = "No active call tab (Meet / Teams / Zoom)";
-      $("error-banner").hidden = false;
-      $("error-text").textContent =
-        res?.error ||
-        "Open Google Meet, Microsoft Teams, or Zoom Web in the active tab.";
-      return;
+  const masterToggle = document.getElementById("master-toggle");
+  const statusDot = document.getElementById("status-dot");
+  const statusText = document.getElementById("status-text");
+  const platformLabel = document.getElementById("platform-label");
+  const presetSelect = document.getElementById("preset-select");
+  const sensRange = document.getElementById("sens-range");
+  const sensVal = document.getElementById("sens-val");
+  const audioToggle = document.getElementById("audio-toggle");
+  const audioState = document.getElementById("audio-state");
+  const lowPowerToggle = document.getElementById("lowpower-toggle");
+  const lowPowerState = document.getElementById("lowpower-state");
+  const btnVanish = document.getElementById("btn-vanish");
+  const btnRestore = document.getElementById("btn-restore");
+  const btnOpenStudio = document.getElementById("btn-open-studio");
+
+  let currentSettings = {
+    enabled: true,
+    sensitivity: 62,
+    effect: "dust",
+    lowPowerMode: false,
+    gesture: { enabled: true, sensitivity: 62, requireAudioConfirm: true },
+    audio: { enabled: true },
+  };
+  let callState = { ok: false, engineState: "live", host: null, interceptionMode: "inactive" };
+
+  function renderUI() {
+    const enabled = currentSettings.enabled !== false;
+    masterToggle.setAttribute("aria-checked", String(enabled));
+    sensRange.value = String(currentSettings.sensitivity || 62);
+    sensVal.textContent = `${currentSettings.sensitivity || 62}/100`;
+    sensRange.disabled = !enabled;
+    presetSelect.disabled = !enabled;
+
+    if (PRESET_CONFIGS[currentSettings.effect]) {
+      presetSelect.value = currentSettings.effect;
     }
-    $("error-banner").hidden = true;
-    if (res.host) {
-      $("host").textContent = `${res.host} · ${res.interceptionMode || "overlay"}`;
+
+    const audioOn =
+      currentSettings.audio?.enabled !== false &&
+      currentSettings.gesture?.requireAudioConfirm !== false;
+    audioToggle.setAttribute("data-on", String(audioOn));
+    audioState.textContent = audioOn ? "ON" : "OFF";
+
+    const lpOn = Boolean(currentSettings.lowPowerMode);
+    lowPowerToggle.setAttribute("data-on", String(lpOn));
+    lowPowerState.textContent = lpOn ? "ON" : "OFF";
+
+    if (!enabled) {
+      statusDot.setAttribute("data-tone", "muted");
+      statusText.textContent = "PAUSED";
+      btnVanish.disabled = true;
+    } else if (callState.engineState === "vanished") {
+      statusDot.setAttribute("data-tone", "amber");
+      statusText.textContent = "VANISHED · PLATE";
+      btnVanish.textContent = "Snap Return";
+      btnVanish.disabled = !callState.ok;
+    } else {
+      statusDot.setAttribute("data-tone", "emerald");
+      statusText.textContent = callState.ok ? "ARMED · LIVE CALL" : "ARMED · NO CALL TAB";
+      btnVanish.textContent = "Test Vanish";
+      btnVanish.disabled = !callState.ok;
     }
-    if (res.engineState) state.engineState = res.engineState;
-    if (typeof res.muted === "boolean") state.muted = res.muted;
-    paint();
-  });
-}
 
-chrome.storage.sync
-  .get(null)
-  .then((stored) => {
-    if (stored && typeof stored === "object") {
-      Object.assign(state, stored);
+    if (callState.ok && callState.host) {
+      const modeTag =
+        callState.interceptionMode === "webrtc-sender" ? "WebRTC" : "Tile";
+      platformLabel.textContent = `${callState.host} · ${modeTag}`;
+    } else {
+      platformLabel.textContent = "Open Meet / Teams / Zoom";
     }
-    paint();
-    refreshTabState();
-  })
-  .catch(() => {
-    paint();
-  });
-
-$("enabled").addEventListener("click", () => {
-  state.enabled = !state.enabled;
-  paint();
-  persist();
-});
-
-$("snap").addEventListener("click", () => {
-  chrome.runtime.sendMessage({ type: "SNAP_TOGGLE" }, (res) => {
-    if (chrome.runtime.lastError || !res?.ok) {
-      $("error-banner").hidden = false;
-      $("error-text").textContent =
-        res?.error || "Unable to trigger on this tab. Open a supported call tab.";
-      return;
-    }
-    $("error-banner").hidden = true;
-    if (res.engineState) state.engineState = res.engineState;
-    if (typeof res.muted === "boolean") state.muted = res.muted;
-    paint();
-  });
-});
-
-$("emergency-restore").addEventListener("click", () => {
-  chrome.runtime.sendMessage({ type: "EMERGENCY_RESTORE" }, (res) => {
-    state.engineState = "live";
-    state.muted = false;
-    if (res?.ok) {
-      $("error-banner").hidden = true;
-    }
-    paint();
-  });
-});
-
-$("retry-btn").addEventListener("click", () => {
-  refreshTabState();
-});
-
-$("effect").addEventListener("change", (e) => {
-  state.effect = e.target.value;
-  state.meetingMode = "custom";
-  paint();
-  persist();
-});
-
-$("meetingMode").addEventListener("change", (e) => {
-  const mode = e.target.value;
-  state.meetingMode = mode;
-  if (MODE_PRESETS[mode]) {
-    Object.assign(state, MODE_PRESETS[mode]);
   }
-  paint();
-  persist();
-});
 
-["sensitivity", "duration", "density"].forEach((id) =>
-  $(id).addEventListener("input", (e) => {
-    state[id] = Number(e.target.value);
-    state.meetingMode = "custom";
-    paint();
-    persist();
-  }),
-);
+  function pushSettingsPatch(patch) {
+    currentSettings = {
+      ...currentSettings,
+      ...patch,
+      gesture: { ...(currentSettings.gesture || {}), ...(patch.gesture || {}) },
+      audio: { ...(currentSettings.audio || {}), ...(patch.audio || {}) },
+    };
+    renderUI();
+    chrome.runtime.sendMessage({
+      type: "SETTINGS_CHANGED",
+      payload: currentSettings,
+    });
+  }
 
-document.querySelectorAll("#direction button").forEach((b) =>
-  b.addEventListener("click", () => {
-    state.direction = b.dataset.dir;
-    paint();
-    persist();
-  }),
-);
+  chrome.storage.sync.get(null, (stored) => {
+    const s = stored?.snap_vanish_settings_v2 || stored || {};
+    currentSettings = {
+      ...currentSettings,
+      ...s,
+      gesture: { ...currentSettings.gesture, ...(s.gesture || {}) },
+      audio: { ...currentSettings.audio, ...(s.audio || {}) },
+    };
+    renderUI();
+  });
 
-$("sound").addEventListener("change", (e) => {
-  state.sound = e.target.checked;
-  paint();
-  persist();
-});
+  // Load any custom user presets from chrome.storage.local
+  chrome.storage.local.get(["snap_vanish_presets_v2"], (res) => {
+    const custom = res?.snap_vanish_presets_v2;
+    if (Array.isArray(custom)) {
+      for (const p of custom) {
+        if (p && p.id && p.name && p.config) {
+          PRESET_CONFIGS[p.id] = p.config;
+          const opt = document.createElement("option");
+          opt.value = p.id;
+          opt.textContent = `${p.name} (Custom)`;
+          presetSelect.appendChild(opt);
+        }
+      }
+    }
+  });
 
-$("lowPowerMode").addEventListener("change", (e) => {
-  state.lowPowerMode = e.target.checked;
-  paint();
-  persist();
-});
+  function refreshCallState() {
+    chrome.runtime.sendMessage({ type: "GET_STATE" }, (res) => {
+      if (chrome.runtime.lastError || !res) {
+        callState = { ok: false, engineState: "live", host: null, interceptionMode: "inactive" };
+      } else {
+        callState = res;
+      }
+      renderUI();
+    });
+  }
+  refreshCallState();
+
+  masterToggle.addEventListener("click", () => {
+    pushSettingsPatch({ enabled: currentSettings.enabled === false });
+  });
+
+  presetSelect.addEventListener("change", () => {
+    const chosen = PRESET_CONFIGS[presetSelect.value];
+    if (chosen) {
+      pushSettingsPatch(chosen);
+    }
+  });
+
+  sensRange.addEventListener("input", () => {
+    const val = Number(sensRange.value);
+    sensVal.textContent = `${val}/100`;
+    pushSettingsPatch({
+      sensitivity: val,
+      gesture: { sensitivity: val, mode: "custom" },
+    });
+  });
+
+  audioToggle.addEventListener("click", () => {
+    const currentlyOn = audioToggle.getAttribute("data-on") === "true";
+    pushSettingsPatch({
+      audio: { enabled: !currentlyOn },
+      gesture: { requireAudioConfirm: !currentlyOn },
+    });
+  });
+
+  lowPowerToggle.addEventListener("click", () => {
+    const currentlyOn = lowPowerToggle.getAttribute("data-on") === "true";
+    pushSettingsPatch({ lowPowerMode: !currentlyOn });
+  });
+
+  btnVanish.addEventListener("click", () => {
+    chrome.runtime.sendMessage({ type: "SNAP_NOW" }, () => {
+      setTimeout(refreshCallState, 150);
+    });
+  });
+
+  btnRestore.addEventListener("click", () => {
+    chrome.runtime.sendMessage({ type: "EMERGENCY_RESTORE" }, () => {
+      setTimeout(refreshCallState, 100);
+    });
+  });
+
+  btnOpenStudio.addEventListener("click", () => {
+    chrome.runtime.sendMessage({ type: "OPEN_STUDIO" });
+    window.close();
+  });
+})();

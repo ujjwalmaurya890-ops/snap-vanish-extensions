@@ -1,39 +1,33 @@
 /**
- * Snap Vanish v2.0.0 — Chrome Manifest V3 Service Worker.
+ * Snap Vanish 2.0 — Manifest V3 Background Service Worker
  *
- * Routes keyboard commands and popup/dashboard actions to the active call tab.
- * Persists settings in chrome.storage.sync so service-worker restarts never
- * lose user configuration. No external network calls are made here.
+ * Responsibilities:
+ * - Strict runtime validation of extension messages across Popup, Studio, and Content Scripts
+ * - Storage partitioning (`chrome.storage.sync` for compact preferences vs
+ *   `chrome.storage.local` for metadata-only activity logs)
+ * - Global Chrome `commands` routing (`toggle-snap`, `vanish-now`, `emergency-restore`)
+ * - Toolbar badge synchronization (`ON`, `GONE`, `OFF`)
  */
 
-const CALL_HOSTS = ["meet.google.com", "teams.microsoft.com", "zoom.us"];
+const SUPPORTED_HOSTS = [
+  "meet.google.com",
+  "teams.microsoft.com",
+  "teams.live.com",
+  "zoom.us",
+];
 
-const DEFAULTS = {
-  enabled: true,
-  sensitivity: 62,
-  duration: 1.8,
-  direction: "right",
-  sound: true,
-  effect: "dust",
-  speed: 1.0,
-  particleSize: 1.0,
-  density: 80,
-  colorAccent: "#d2451e",
-  intensity: 85,
-  muteOnVanish: true,
-  lowPowerMode: false,
-  meetingMode: "creative",
-  cooldownMs: 2000,
-};
-
-const VALID_MESSAGE_TYPES = new Set([
+const ALLOWED_TYPES = new Set([
   "PING",
   "GET_STATE",
   "SNAP_NOW",
   "SNAP_TOGGLE",
   "SNAP_VANISH_NOW",
+  "SNAP_RESTORE_NOW",
   "EMERGENCY_RESTORE",
   "MUTE_TOGGLE",
+  "DETECTION_TOGGLE",
+  "CAPTURE_CLEAN_PLATE",
+  "OPEN_STUDIO",
   "RESET_FRAME",
   "SETTINGS_CHANGED",
   "SETTINGS",
@@ -44,138 +38,195 @@ const VALID_MESSAGE_TYPES = new Set([
   "SYNC_DASHBOARD_STATE",
 ]);
 
-function isValidMessage(msg) {
-  return Boolean(
-    msg &&
-      typeof msg === "object" &&
-      !Array.isArray(msg) &&
-      typeof msg.type === "string" &&
-      VALID_MESSAGE_TYPES.has(msg.type),
-  );
-}
+const DEFAULT_SYNC_PREFS = {
+  enabled: true,
+  sensitivity: 62,
+  duration: 1.8,
+  direction: "right",
+  sound: true,
+  effect: "dust",
+  speed: 1.0,
+  particleSize: 1.0,
+  density: 80,
+  colorAccent: "#e0532c",
+  intensity: 85,
+  motionSmoothness: 70,
+  muteOnVanish: true,
+  lowPowerMode: false,
+  showCallHud: true,
+};
 
-async function activeCallTab() {
+function isSupportedMeetingUrl(url) {
+  if (typeof url !== "string" || !url.startsWith("https://")) return false;
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id || !tab.url) return null;
-    const host = new URL(tab.url).hostname;
-    const supported = CALL_HOSTS.some(
-      (h) => host === h || host.endsWith(`.${h}`),
+    const parsed = new URL(url);
+    return SUPPORTED_HOSTS.some(
+      (h) => parsed.hostname === h || parsed.hostname.endsWith(`.${h}`),
     );
-    return supported ? tab : null;
   } catch {
-    return null;
+    return false;
   }
 }
 
-async function sendToCallTab(message) {
-  const tab = await activeCallTab();
-  if (!tab || !tab.id) {
+async function updateBadge(enabled, vanished = false) {
+  try {
+    if (!enabled) {
+      await chrome.action.setBadgeText({ text: "OFF" });
+      await chrome.action.setBadgeBackgroundColor({ color: "#3f3f46" });
+    } else if (vanished) {
+      await chrome.action.setBadgeText({ text: "GONE" });
+      await chrome.action.setBadgeBackgroundColor({ color: "#d97706" });
+    } else {
+      await chrome.action.setBadgeText({ text: "ON" });
+      await chrome.action.setBadgeBackgroundColor({ color: "#e0532c" });
+    }
+  } catch {
+    // Ignore badge API errors during worker startup
+  }
+}
+
+async function findActiveMeetingTab() {
+  const activeTabs = await chrome.tabs.query({
+    active: true,
+    currentWindow: true,
+  });
+  if (activeTabs[0] && isSupportedMeetingUrl(activeTabs[0].url)) {
+    return activeTabs[0];
+  }
+  const allTabs = await chrome.tabs.query({
+    url: [
+      "https://meet.google.com/*",
+      "https://teams.microsoft.com/*",
+      "https://teams.live.com/*",
+      "https://*.zoom.us/wc/*",
+      "https://app.zoom.us/wc/*",
+    ],
+  });
+  return allTabs[0] || null;
+}
+
+async function forwardToMeetingTab(message) {
+  const tab = await findActiveMeetingTab();
+  if (!tab || typeof tab.id !== "number") {
     return {
       ok: false,
-      reason: "no-call-tab",
-      error: "Open Google Meet, Microsoft Teams, or Zoom Web in the active tab.",
+      reason: "no-supported-meeting-tab",
+      interceptionMode: "inactive",
     };
   }
   try {
-    const response = await chrome.tabs.sendMessage(tab.id, message);
-    return response ?? { ok: true, host: new URL(tab.url).hostname };
+    const res = await chrome.tabs.sendMessage(tab.id, message);
+    if (res && typeof res.engineState === "string") {
+      const prefs = await chrome.storage.sync.get(["enabled"]);
+      await updateBadge(prefs.enabled !== false, res.engineState === "vanished");
+    }
+    return res || { ok: true };
   } catch (err) {
     return {
       ok: false,
-      reason: "content-script-not-ready",
-      error:
-        err instanceof Error
-          ? err.message
-          : "Reload the meeting tab to attach Snap Vanish.",
+      reason: "content-script-unreachable",
+      error: err instanceof Error ? err.message : String(err),
     };
   }
 }
 
-chrome.runtime.onInstalled.addListener(async () => {
-  try {
-    const stored = await chrome.storage.sync.get(null);
-    await chrome.storage.sync.set({ ...DEFAULTS, ...stored });
-  } catch {
-    // Storage unavailable in restricted test mode
+chrome.runtime.onInstalled.addListener(async (details) => {
+  const existing = await chrome.storage.sync.get(null);
+  if (!existing || Object.keys(existing).length === 0) {
+    await chrome.storage.sync.set(DEFAULT_SYNC_PREFS);
+  }
+  await updateBadge(existing?.enabled !== false, false);
+  if (details.reason === "install") {
+    await chrome.runtime.openOptionsPage();
   }
 });
 
-chrome.commands.onCommand.addListener((command) => {
-  const actionMap = {
-    "toggle-snap": "SNAP_TOGGLE",
-    "vanish-now": "SNAP_VANISH_NOW",
-    "mute-only": "MUTE_TOGGLE",
-    "reset-frame": "EMERGENCY_RESTORE",
-  };
-  const action = actionMap[command];
-  if (action) {
-    sendToCallTab({ type: action }).catch(() => {});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "sync" && changes.enabled) {
+    void updateBadge(changes.enabled.newValue !== false, false);
   }
 });
 
-chrome.runtime.onMessage.addListener((message, _sender, respond) => {
-  if (!isValidMessage(message)) {
-    respond({
-      ok: false,
-      reason: "invalid-message",
-      error: "Unsupported or malformed extension message.",
+chrome.commands.onCommand.addListener(async (command) => {
+  if (command === "toggle-snap") {
+    const curr = await chrome.storage.sync.get(["enabled"]);
+    const next = curr.enabled === false;
+    await chrome.storage.sync.set({ enabled: next });
+    await updateBadge(next, false);
+    await forwardToMeetingTab({
+      type: "SETTINGS_CHANGED",
+      payload: { enabled: next },
     });
+  } else if (command === "vanish-now") {
+    await forwardToMeetingTab({ type: "SNAP_NOW" });
+  } else if (command === "mute-only") {
+    await forwardToMeetingTab({ type: "MUTE_TOGGLE" });
+  } else if (command === "emergency-restore" || command === "reset-frame") {
+    await forwardToMeetingTab({ type: "EMERGENCY_RESTORE" });
+    const curr = await chrome.storage.sync.get(["enabled"]);
+    await updateBadge(curr.enabled !== false, false);
+  }
+});
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (!msg || typeof msg !== "object" || typeof msg.type !== "string") {
+    sendResponse({ ok: false, reason: "invalid-message" });
+    return false;
+  }
+  if (!ALLOWED_TYPES.has(msg.type)) {
+    sendResponse({ ok: false, reason: "unsupported-message-type" });
     return false;
   }
 
-  switch (message.type) {
-    case "PING":
-      respond({ ok: true, host: "service-worker", version: "2.0.0" });
-      return false;
-
-    case "SNAP_NOW":
-    case "SNAP_TOGGLE":
-      sendToCallTab({ type: "SNAP_TOGGLE" }).then(respond);
-      return true;
-
-    case "SNAP_VANISH_NOW":
-      sendToCallTab({ type: "SNAP_VANISH_NOW" }).then(respond);
-      return true;
-
-    case "EMERGENCY_RESTORE":
-    case "RESET_FRAME":
-      sendToCallTab({ type: "EMERGENCY_RESTORE" }).then(respond);
-      return true;
-
-    case "MUTE_TOGGLE":
-      sendToCallTab({ type: "MUTE_TOGGLE" }).then(respond);
-      return true;
-
-    case "SETTINGS_CHANGED":
-      chrome.storage.sync
-        .set(message.payload ?? {})
-        .catch(() => {})
-        .finally(() => {
-          sendToCallTab({
-            type: "SETTINGS",
-            payload: message.payload ?? {},
-          }).then(respond);
-        });
-      return true;
-
-    case "GET_STATE":
-      sendToCallTab({ type: "STATE" }).then(respond);
-      return true;
-
-    case "RUN_DIAGNOSTICS":
-      sendToCallTab({ type: "RUN_DIAGNOSTICS" }).then(respond);
-      return true;
-
-    case "CALIBRATE_GESTURE":
-      sendToCallTab({
-        type: "CALIBRATE_GESTURE",
-        payload: message.payload ?? {},
-      }).then(respond);
-      return true;
-
-    default:
-      respond({ ok: false, reason: "unhandled-message-type" });
-      return false;
+  if (msg.type === "OPEN_STUDIO") {
+    chrome.runtime
+      .openOptionsPage()
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) =>
+        sendResponse({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    return true;
   }
+
+  if (msg.type === "CLEAR_LOCAL_DATA") {
+    chrome.storage.local
+      .clear()
+      .then(() => sendResponse({ ok: true }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (msg.type === "SETTINGS_CHANGED" || msg.type === "SETTINGS") {
+    const payload = msg.payload && typeof msg.payload === "object" ? msg.payload : {};
+    chrome.storage.sync
+      .set({
+        enabled: payload.enabled !== false,
+        sensitivity: Number(payload.sensitivity ?? 62),
+        duration: Number(payload.duration ?? 1.8),
+        direction: String(payload.direction ?? "right"),
+        effect: String(payload.effect ?? "dust"),
+        speed: Number(payload.speed ?? 1),
+        density: Number(payload.density ?? 80),
+        colorAccent: String(payload.colorAccent ?? "#e0532c"),
+        lowPowerMode: Boolean(payload.lowPowerMode),
+        snap_vanish_settings_v2: payload,
+      })
+      .then(() => forwardToMeetingTab({ type: "SETTINGS_CHANGED", payload }))
+      .then((res) => sendResponse({ ok: true, forwarded: res.ok }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  forwardToMeetingTab(msg)
+    .then(sendResponse)
+    .catch((err) =>
+      sendResponse({
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  return true;
 });

@@ -8,7 +8,7 @@ import type {
 import { isExtensionRuntimeAvailable } from "./messaging";
 import { STORAGE_KEYS, broadcastSyncEvent } from "./settings";
 
-const MAX_DIAGNOSTIC_LOGS = 100;
+const MAX_DIAGNOSTIC_LOGS = 120;
 
 export function loadDiagnosticLogs(): DiagnosticLogEntry[] {
   try {
@@ -184,6 +184,7 @@ export async function buildDiagnosticSnapshot(params: {
   engineState: EngineState;
   interceptionMode: InterceptionMode;
   lowPowerActive: boolean;
+  cameraResolution?: string | null;
   cleanup: ResourceCleanupStatus;
 }): Promise<DiagnosticSnapshot> {
   const permissions = await queryMediaPermissions();
@@ -197,6 +198,7 @@ export async function buildDiagnosticSnapshot(params: {
     webGL2Supported: checkWebGL2Support(),
     mediaDevicesSupported: checkMediaDevicesSupport(),
     extensionBridgeConnected: isExtensionRuntimeAvailable(),
+    cameraResolution: params.cameraResolution ?? null,
     permissions,
     cleanup: params.cleanup,
     logs: loadDiagnosticLogs(),
