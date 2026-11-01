@@ -47,6 +47,16 @@ export type MeetingModeId =
 
 export type DetectionMode = "beginner" | "balanced" | "precision" | "custom";
 
+/**
+ * How a vanish may be triggered (brief §3):
+ * - "smart": visual snap gesture + acoustic transient confirmation (default)
+ * - "gesture-only": visual snap gesture alone — the microphone is never opened
+ * - "manual": no automatic detection at all — popup, HUD, or keyboard shortcut only
+ *
+ * In every mode, sound alone can never trigger a vanish.
+ */
+export type DetectionTriggerMode = "smart" | "gesture-only" | "manual";
+
 export type GesturePhase =
   | "no-hand"
   | "hand-detected"
@@ -74,6 +84,8 @@ export type HudPosition = "bottom-right" | "bottom-left" | "top-right";
 
 export interface GestureSettings {
   enabled: boolean;
+  /** Trigger policy: smart (gesture+audio) | gesture-only | manual. */
+  detectionMode: DetectionTriggerMode;
   mode: DetectionMode;
   sensitivity: number; // 0 - 100
   minHandConfidence: number; // 0.3 - 0.95

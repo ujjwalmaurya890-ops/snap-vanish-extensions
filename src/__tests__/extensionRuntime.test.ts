@@ -10,7 +10,8 @@ describe("7. Chrome Extension Manifest, Service Worker & Content Script Verifica
 
     const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
     expect(manifest.manifest_version).toBe(3);
-    expect(manifest.version).toBe("2.0.0");
+    // Any 2.x release is acceptable; the exact number lives in the manifest.
+    expect(manifest.version).toMatch(/^2\.\d+\.\d+$/);
     // Minimal permission surface: no "tabs", no "activeTab", no "<all_urls>".
     expect(manifest.permissions).toEqual(["storage", "offscreen"]);
     expect(manifest.permissions).not.toContain("tabs");

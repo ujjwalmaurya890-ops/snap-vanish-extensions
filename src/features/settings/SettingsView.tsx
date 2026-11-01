@@ -40,6 +40,7 @@ import {
 import type {
   CameraSettings,
   DetectionMode,
+  DetectionTriggerMode,
   EffectPreset,
   GestureAction,
   HudPosition,
@@ -394,6 +395,81 @@ export default function SettingsView({
                   })
                 }
               />
+            </div>
+
+            <div>
+              <div className="rail text-[#ff9d80]">DETECTION MODE</div>
+              <p className="mt-1 text-[12px] text-[#8b92a5]">
+                Sound alone never triggers a vanish in any mode. In Gesture and
+                Manual modes the microphone is never opened for detection.
+              </p>
+              <div
+                className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3"
+                role="radiogroup"
+                aria-label="Detection mode"
+              >
+                {(
+                  [
+                    {
+                      id: "smart",
+                      name: "Smart Mode",
+                      desc: "Visual snap gesture confirmed by the acoustic snap transient. Fewest false triggers.",
+                    },
+                    {
+                      id: "gesture-only",
+                      name: "Gesture Mode",
+                      desc: "Visual snap gesture only — no audio confirmation and the microphone stays closed.",
+                    },
+                    {
+                      id: "manual",
+                      name: "Manual Mode",
+                      desc: "No automatic detection. Trigger from the popup, meeting HUD, or Alt+Shift+D.",
+                    },
+                  ] as Array<{
+                    id: DetectionTriggerMode;
+                    name: string;
+                    desc: string;
+                  }>
+                ).map((m) => {
+                  const selected = settings.gesture.detectionMode === m.id;
+                  return (
+                    <button
+                      key={m.id}
+                      type="button"
+                      role="radio"
+                      aria-checked={selected}
+                      onClick={() =>
+                        onPatchSettings({
+                          gesture: {
+                            ...settings.gesture,
+                            detectionMode: m.id,
+                            enabled:
+                              m.id === "manual"
+                                ? settings.gesture.enabled
+                                : true,
+                            requireAudioConfirm:
+                              m.id === "smart"
+                                ? true
+                                : settings.gesture.requireAudioConfirm,
+                          },
+                        })
+                      }
+                      className={`rounded-xl border p-3.5 text-left transition-all ${
+                        selected
+                          ? "border-[#f0623a] bg-[#e0532c]/15"
+                          : "border-white/10 bg-[#181b23] hover:border-white/20"
+                      }`}
+                    >
+                      <div className="font-mono text-[11px] uppercase text-[#ff9d80]">
+                        {m.name}
+                      </div>
+                      <p className="mt-1 text-[11.5px] text-[#9ca3b8]">
+                        {m.desc}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
 
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">

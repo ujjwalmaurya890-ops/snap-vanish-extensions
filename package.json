@@ -1,7 +1,7 @@
 {
   "name": "snap-vanish-extension",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,7 +13,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "bench": "vite-node scripts/bench-dust.mts",
-    "verify": "tsc --noEmit && vitest run && node scripts/build-extension.mjs"
+    "verify": "tsc --noEmit && node scripts/build-extension.mjs && vitest run"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.2.0",

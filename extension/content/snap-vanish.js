@@ -56,6 +56,7 @@
     pauseWhenHidden: true,
     gesture: {
       enabled: true,
+      detectionMode: "smart",
       mode: "balanced",
       sensitivity: 62,
       minHandConfidence: 0.62,
@@ -83,10 +84,32 @@
     mutedByExtension: false,
     bridgeToken: null,
     busy: false,
+    // Initialised here (not only in applySettings) so a vanish before the
+    // first storage read can never dereference an undefined accent colour.
+    accentRgb: { r: 224, g: 83, b: 44 },
   };
 
   const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
   const nowMs = () => performance.now();
+
+  /* Detection policy (brief §3) — mirrors `resolveDetectionPolicy` in
+   * `src/lib/settings.ts` so every surface agrees:
+   * - smart:        visual snap + acoustic confirmation (mic may open)
+   * - gesture-only: visual snap alone (mic never opens)
+   * - manual:       no automatic detection (popup / HUD / shortcut only)
+   * Sound alone can never trigger a vanish in any mode. */
+  const detectionMode = () => state.cfg.gesture?.detectionMode || "smart";
+  const detectionActive = () =>
+    Boolean(state.cfg.enabled) &&
+    state.cfg.gesture?.enabled !== false &&
+    detectionMode() !== "manual";
+  const audioConfirmRequired = () =>
+    detectionMode() === "smart" &&
+    state.cfg.gesture?.requireAudioConfirm !== false;
+  const microphoneAllowed = () =>
+    detectionActive() &&
+    audioConfirmRequired() &&
+    state.cfg.audio?.enabled !== false;
 
   /* ================================================================== *
    * 1. HUD + overlay — closed shadow root, zero host DOM mutation
@@ -482,16 +505,74 @@
         particles.g[n] = img[idx + 1];
         particles.b[n] = img[idx + 2];
         particles.size[n] = stride * (0.85 + Math.random() * 1.15) * sizeMult;
-        particles.delay[n] = (x / w) * 0.42 + Math.random() * 0.16;
         particles.seed[n] = seed;
-        particles.vx[n] = left
-          ? -(95 + Math.random() * 140)
-          : up
-            ? (Math.random() - 0.5) * 70
-            : 95 + Math.random() * 140;
-        particles.vy[n] = down ? 65 + Math.random() * 110 : -(45 + Math.random() * 115);
+        // Per-effect velocity fields (brief §4) — the in-call renderer must
+        // honour the same effect the Studio preview shows:
+        //   dust                → Classic Dust (directional ember drift)
+        //   cinematic-...       → Infinity Snap (spiral swirl, applied in emit)
+        //   light-burst         → Energy Burst (radial outward impulse)
+        //   fade-out            → Smoke Dissolve (slow, soft, rising)
+        //   digital-glitch      → Digital Disintegration (blocks, quantised)
+        //   pixel-dissolve      → Pixel rain (random order, falls)
+        //   fine-particles      → Fine ash (tiny, gentle thermal rise)
+        const fx = state.cfg.effect;
+        const intensityScale = clamp((state.cfg.intensity || 85) / 85, 0.3, 1.6);
+        const rnd = Math.random();
+        if (fx === "light-burst") {
+          const dx = (x - cx) / Math.max(1, rx);
+          const dy = (y - cy) / Math.max(1, ry);
+          const len = Math.max(0.18, Math.sqrt(dx * dx + dy * dy));
+          const mag = (150 + rnd * 220) * intensityScale;
+          particles.vx[n] = (dx / len) * mag;
+          particles.vy[n] = (dy / len) * mag - 20;
+          particles.delay[n] = len * 0.12 + rnd * 0.05;
+          particles.shard[n] = seed < 0.1 ? 1 : 0;
+        } else if (fx === "fade-out") {
+          particles.vx[n] = (rnd - 0.5) * 36 * intensityScale;
+          particles.vy[n] = -(18 + rnd * 42) * intensityScale;
+          particles.delay[n] = rnd * 0.3;
+          particles.size[n] = particles.size[n] * 1.9;
+          particles.shard[n] = 0;
+        } else if (fx === "digital-glitch") {
+          particles.vx[n] = (rnd - 0.5) * 90 * intensityScale;
+          particles.vy[n] = (55 + rnd * 120) * intensityScale;
+          particles.delay[n] = rnd * 0.38;
+          particles.size[n] = particles.size[n] * 1.5;
+          particles.shard[n] = 1;
+        } else if (fx === "pixel-dissolve") {
+          particles.vx[n] = (rnd - 0.5) * 44 * intensityScale;
+          particles.vy[n] = (70 + rnd * 130) * intensityScale;
+          particles.delay[n] = rnd * 0.45;
+          particles.shard[n] = seed < 0.3 ? 1 : 0;
+        } else if (fx === "fine-particles") {
+          particles.vx[n] = (rnd - 0.5) * 52 * intensityScale;
+          particles.vy[n] = -(30 + rnd * 70) * intensityScale;
+          particles.delay[n] = (x / w) * 0.3 + rnd * 0.22;
+          particles.size[n] = particles.size[n] * 0.65;
+          particles.shard[n] = 0;
+        } else if (fx === "cinematic-disintegration") {
+          // Base drift + tangential swirl (rotation applied in emitParticles).
+          const dx = (x - cx) / Math.max(1, rx);
+          const dy = (y - cy) / Math.max(1, ry);
+          particles.vx[n] = (70 + rnd * 120) * intensityScale - dy * 60;
+          particles.vy[n] = -(35 + rnd * 95) * intensityScale + dx * 60;
+          particles.delay[n] = (x / w) * 0.36 + rnd * 0.18;
+          particles.shard[n] = seed < 0.22 ? 1 : 0;
+        } else {
+          particles.vx[n] = (
+            left
+              ? -(95 + rnd * 140)
+              : up
+                ? (rnd - 0.5) * 70
+                : 95 + rnd * 140
+          ) * intensityScale;
+          particles.vy[n] = (
+            down ? 65 + rnd * 110 : -(45 + rnd * 115)
+          ) * intensityScale;
+          particles.delay[n] = (x / w) * 0.42 + rnd * 0.16;
+          particles.shard[n] = seed < 0.16 ? 1 : 0;
+        }
         particles.spin[n] = (Math.random() - 0.5) * 4.2;
-        particles.shard[n] = seed < 0.16 ? 1 : 0;
         n += 1;
       }
       if (n >= MAX_PARTICLES) break;
@@ -544,6 +625,10 @@
     const limit = Math.floor(total * density);
     const speed = state.cfg.speed || 1;
     const accent = state.accentRgb;
+    const swirl = state.cfg.effect === "cinematic-disintegration";
+    const quantise = state.cfg.effect === "digital-glitch";
+    const centreX = frame.w * 0.5;
+    const centreY = frame.h * 0.56;
     let visible = 0;
 
     for (let i = 0; i < limit; i++) {
@@ -552,8 +637,24 @@
       const local = (t - delay) / 0.55;
       if (local <= 0 || local >= 1) continue;
       const ease = local * local * (3 - 2 * local);
-      const px = particles.x[i] + particles.vx[i] * ease * speed;
-      const py = particles.y[i] + particles.vy[i] * ease * speed;
+      let px = particles.x[i] + particles.vx[i] * ease * speed;
+      let py = particles.y[i] + particles.vy[i] * ease * speed;
+      if (swirl) {
+        // Infinity Snap: rotate the drifted position around the subject
+        // centre so particles visibly spiral before they fade.
+        const angle = ease * (1.1 + particles.seed[i] * 1.4);
+        const cos = Math.cos(angle);
+        const sin = Math.sin(angle);
+        const ox = px - centreX;
+        const oy = py - centreY;
+        px = centreX + ox * cos - oy * sin;
+        py = centreY + ox * sin + oy * cos;
+      } else if (quantise) {
+        // Digital Disintegration: snap motion to a coarse grid for a
+        // blocky, stepped corruption feel.
+        px = Math.round(px / 6) * 6;
+        py = Math.round(py / 6) * 6;
+      }
       const alpha = (1 - ease) * 0.92;
       if (alpha <= 0.02) continue;
 
@@ -787,7 +888,8 @@
 
   async function ensureAudioGate() {
     if (audioAnalyser) return true;
-    if (!state.cfg.audio?.enabled || !state.cfg.gesture?.requireAudioConfirm) return false;
+    // The microphone is opened only in Smart mode with confirmation enabled.
+    if (!microphoneAllowed()) return false;
     if (!navigator.mediaDevices?.getUserMedia) return false;
     try {
       micStream = await navigator.mediaDevices.getUserMedia({
@@ -971,7 +1073,7 @@
       pendingVisualSnapAt = null;
       return false;
     }
-    if (!state.cfg.gesture?.requireAudioConfirm || !audioAnalyser) {
+    if (!audioConfirmRequired() || !audioAnalyser) {
       pendingVisualSnapAt = null;
       lastSnapAt = now;
       snapHistory.length = 0;
@@ -1036,8 +1138,7 @@
     };
 
     const shouldRun = () =>
-      state.cfg.enabled &&
-      state.cfg.gesture?.enabled &&
+      detectionActive() &&
       !(state.cfg.pauseWhenHidden && document.hidden) &&
       (state.engineState === "live" || state.engineState === "vanished");
 
@@ -1268,18 +1369,118 @@
    * 11. Settings
    * ================================================================== */
 
-  function applySettings(raw) {
-    if (!raw || typeof raw !== "object") return;
+  const VALID_CFG_EFFECTS = new Set([
+    "dust",
+    "cinematic-disintegration",
+    "fine-particles",
+    "pixel-dissolve",
+    "digital-glitch",
+    "fade-out",
+    "light-burst",
+  ]);
+  const VALID_CFG_DIRECTIONS = new Set(["left", "right", "up", "down", "toward"]);
+  const VALID_CFG_TRIGGER_MODES = new Set(["smart", "gesture-only", "manual"]);
+  const VALID_CFG_HUD_POSITIONS = new Set([
+    "bottom-right",
+    "bottom-left",
+    "top-right",
+  ]);
+
+  /**
+   * Settings arriving from storage or messages are untrusted: only
+   * allowlisted keys with the right type/range are merged, so a corrupt or
+   * hostile payload can never put the render loop into a bad state.
+   */
+  function sanitizeCfgPatch(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
     const s = raw.snap_vanish_settings_v2 || raw;
+    if (!s || typeof s !== "object" || Array.isArray(s)) return null;
+    const num = (v, lo, hi) =>
+      typeof v === "number" && Number.isFinite(v) ? clamp(v, lo, hi) : undefined;
+    const bool = (v) => (typeof v === "boolean" ? v : undefined);
+    const oneOf = (v, set) => (typeof v === "string" && set.has(v) ? v : undefined);
+
+    const patch = {};
+    const put = (key, value) => {
+      if (value !== undefined) patch[key] = value;
+    };
+    put("enabled", bool(s.enabled));
+    put("showCallHud", bool(s.showCallHud));
+    put("hudPosition", oneOf(s.hudPosition, VALID_CFG_HUD_POSITIONS));
+    put("sensitivity", num(s.sensitivity, 0, 100));
+    put("duration", num(s.duration, 0.5, 4.0));
+    put("direction", oneOf(s.direction, VALID_CFG_DIRECTIONS));
+    put("effect", oneOf(s.effect, VALID_CFG_EFFECTS));
+    put("speed", num(s.speed, 0.5, 2.5));
+    put("particleSize", num(s.particleSize, 0.5, 3.0));
+    put("density", num(s.density, 20, 100));
+    put(
+      "colorAccent",
+      typeof s.colorAccent === "string" && /^#[0-9a-f]{6}$/i.test(s.colorAccent)
+        ? s.colorAccent.toLowerCase()
+        : undefined,
+    );
+    put("intensity", num(s.intensity, 10, 100));
+    put("motionSmoothness", num(s.motionSmoothness, 0, 100));
+    put("sound", bool(s.sound));
+    put("muteOnVanish", bool(s.muteOnVanish));
+    put("lowPowerMode", bool(s.lowPowerMode));
+    put("pauseWhenHidden", bool(s.pauseWhenHidden));
+
+    const g = s.gesture && typeof s.gesture === "object" ? s.gesture : null;
+    if (g) {
+      const gesture = {};
+      const gput = (key, value) => {
+        if (value !== undefined) gesture[key] = value;
+      };
+      gput("enabled", bool(g.enabled));
+      gput("detectionMode", oneOf(g.detectionMode, VALID_CFG_TRIGGER_MODES));
+      gput("sensitivity", num(g.sensitivity, 0, 100));
+      gput("minHandConfidence", num(g.minHandConfidence, 0.3, 0.95));
+      gput("inferenceFpsLimit", num(g.inferenceFpsLimit, 10, 30));
+      gput("cooldownMs", num(g.cooldownMs, 500, 10000));
+      gput("requireAudioConfirm", bool(g.requireAudioConfirm));
+      gput(
+        "calibratedCollapseThresholdMm",
+        num(g.calibratedCollapseThresholdMm, 6, 25),
+      );
+      if (Object.keys(gesture).length > 0) patch.gesture = gesture;
+    }
+    const a = s.audio && typeof s.audio === "object" ? s.audio : null;
+    if (a) {
+      const audio = {};
+      if (bool(a.enabled) !== undefined) audio.enabled = a.enabled;
+      const sensitivityDb = num(a.sensitivityDb, 6, 28);
+      if (sensitivityDb !== undefined) audio.sensitivityDb = sensitivityDb;
+      const confirmWindowMs = num(a.confirmWindowMs, 100, 500);
+      if (confirmWindowMs !== undefined) audio.confirmWindowMs = confirmWindowMs;
+      if (Object.keys(audio).length > 0) patch.audio = audio;
+    }
+    const c = s.camera && typeof s.camera === "object" ? s.camera : null;
+    if (c) {
+      const camera = {};
+      if (bool(c.autoRestoreOnLeave) !== undefined) {
+        camera.autoRestoreOnLeave = c.autoRestoreOnLeave;
+      }
+      if (Object.keys(camera).length > 0) patch.camera = camera;
+    }
+    return patch;
+  }
+
+  function applySettings(raw) {
+    const patch = sanitizeCfgPatch(raw);
+    if (!patch) return;
     state.cfg = {
       ...state.cfg,
-      ...s,
-      gesture: { ...state.cfg.gesture, ...(s.gesture || {}) },
-      audio: { ...state.cfg.audio, ...(s.audio || {}) },
-      camera: { ...state.cfg.camera, ...(s.camera || {}) },
+      ...patch,
+      gesture: { ...state.cfg.gesture, ...(patch.gesture || {}) },
+      audio: { ...state.cfg.audio, ...(patch.audio || {}) },
+      camera: { ...state.cfg.camera, ...(patch.camera || {}) },
     };
     state.accentRgb = accentRgb(state.cfg.colorAccent);
-    if (!state.cfg.audio?.enabled || !state.cfg.gesture?.requireAudioConfirm) {
+    // Release the microphone immediately when the policy no longer allows it
+    // (mode switched away from Smart, detection paused, audio disabled…).
+    if (!microphoneAllowed()) {
       releaseAudio();
     }
     updateHud();
@@ -1322,8 +1523,13 @@
       host: location.hostname,
       engineState: state.engineState,
       interceptionMode: state.interceptionMode,
+      // Truthful live status for popup/dashboard (never fabricated):
+      cameraPresent: Boolean(pickSelfVideo()),
       detectionEnabled: Boolean(state.cfg.gesture?.enabled),
+      detectionMode: detectionMode(),
+      detectionActive: detectionActive(),
       handModelReady,
+      audioGateActive: Boolean(audioAnalyser),
       webrtcSendersCount: state.sendersCount,
       muted: state.mutedByExtension,
     };

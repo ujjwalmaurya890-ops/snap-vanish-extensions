@@ -76,6 +76,139 @@ const DEFAULT_SYNC_PREFS = {
   showCallHud: true,
 };
 
+/* ------------------------------------------------------------------ *
+ * Settings sanitisation
+ *
+ * Every `SETTINGS_CHANGED` payload is treated as untrusted input: only
+ * allowlisted keys survive, numbers are clamped to their documented ranges,
+ * and enums/colors must match exactly. Unknown keys are dropped instead of
+ * being mirrored into `chrome.storage.sync`, which previously let any
+ * extension context persist arbitrary junk (brief §9/§13).
+ * ------------------------------------------------------------------ */
+
+const VALID_EFFECTS = new Set([
+  "dust",
+  "cinematic-disintegration",
+  "fine-particles",
+  "pixel-dissolve",
+  "digital-glitch",
+  "fade-out",
+  "light-burst",
+]);
+const VALID_DIRECTIONS = new Set(["left", "right", "up", "down", "toward"]);
+const VALID_TRIGGER_MODES = new Set(["smart", "gesture-only", "manual"]);
+const VALID_DETECTION_PROFILES = new Set([
+  "beginner",
+  "balanced",
+  "precision",
+  "custom",
+]);
+const VALID_HUD_POSITIONS = new Set([
+  "bottom-right",
+  "bottom-left",
+  "top-right",
+]);
+const HEX_COLOR_RE = /^#[0-9a-f]{6}$/i;
+
+function clampNum(value, lo, hi) {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return undefined;
+  return Math.min(hi, Math.max(lo, n));
+}
+
+function pickBool(value) {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function sanitizeNested(source, spec) {
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return undefined;
+  }
+  const out = {};
+  for (const [key, rule] of Object.entries(spec)) {
+    if (source[key] === undefined) continue;
+    const v = rule(source[key]);
+    if (v !== undefined) out[key] = v;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+const GESTURE_SPEC = {
+  enabled: pickBool,
+  detectionMode: (v) => (VALID_TRIGGER_MODES.has(v) ? v : undefined),
+  mode: (v) => (VALID_DETECTION_PROFILES.has(v) ? v : undefined),
+  sensitivity: (v) => clampNum(v, 0, 100),
+  minHandConfidence: (v) => clampNum(v, 0.3, 0.95),
+  landmarkSmoothing: (v) => clampNum(v, 0, 0.85),
+  inferenceFpsLimit: (v) => clampNum(v, 10, 30),
+  cooldownMs: (v) => clampNum(v, 500, 10000),
+  requireAudioConfirm: pickBool,
+  accidentalTriggerProtection: pickBool,
+  calibratedCollapseThresholdMm: (v) => clampNum(v, 6, 25),
+};
+const AUDIO_SPEC = {
+  enabled: pickBool,
+  preferredDeviceId: (v) =>
+    typeof v === "string" ? v.slice(0, 128) : undefined,
+  sensitivityDb: (v) => clampNum(v, 6, 28),
+  confirmWindowMs: (v) => clampNum(v, 100, 500),
+  allowStandaloneAudioTrigger: pickBool,
+};
+const CAMERA_SPEC = {
+  preferredDeviceId: (v) =>
+    typeof v === "string" ? v.slice(0, 128) : undefined,
+  targetResolution: (v) =>
+    ["1280x720", "640x360", "1920x1080"].includes(v) ? v : undefined,
+  mirrorPreview: pickBool,
+  backgroundMode: (v) =>
+    ["captured-plate", "temporal-plate", "ai-segmentation", "studio-fallback"].includes(v)
+      ? v
+      : undefined,
+  autoRestoreOnLeave: pickBool,
+};
+
+/** Returns a new object containing only valid, in-range settings keys. */
+function sanitizeSettingsPatch(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return {};
+  }
+  const flatSpec = {
+    enabled: pickBool,
+    autoStartOnCall: pickBool,
+    showCallHud: pickBool,
+    hudPosition: (v) => (VALID_HUD_POSITIONS.has(v) ? v : undefined),
+    onboardingCompleted: pickBool,
+    sensitivity: (v) => clampNum(v, 0, 100),
+    sound: pickBool,
+    muteOnVanish: pickBool,
+    effect: (v) => (VALID_EFFECTS.has(v) ? v : undefined),
+    direction: (v) => (VALID_DIRECTIONS.has(v) ? v : undefined),
+    duration: (v) => clampNum(v, 0.5, 4.0),
+    speed: (v) => clampNum(v, 0.5, 2.5),
+    particleSize: (v) => clampNum(v, 0.5, 3.0),
+    density: (v) => clampNum(v, 20, 100),
+    colorAccent: (v) =>
+      typeof v === "string" && HEX_COLOR_RE.test(v) ? v.toLowerCase() : undefined,
+    intensity: (v) => clampNum(v, 10, 100),
+    motionSmoothness: (v) => clampNum(v, 0, 100),
+    lowPowerMode: pickBool,
+    pauseWhenHidden: pickBool,
+    maxParticles: (v) => clampNum(v, 4000, 28000),
+    diagnosticLoggingEnabled: pickBool,
+    recordActivityHistory: pickBool,
+    strictLocalOnly: pickBool,
+    schemaVersion: (v) => (v === 2 ? 2 : undefined),
+  };
+  const out = sanitizeNested(payload, flatSpec) ?? {};
+  const gesture = sanitizeNested(payload.gesture, GESTURE_SPEC);
+  if (gesture) out.gesture = gesture;
+  const audio = sanitizeNested(payload.audio, AUDIO_SPEC);
+  if (audio) out.audio = audio;
+  const camera = sanitizeNested(payload.camera, CAMERA_SPEC);
+  if (camera) out.camera = camera;
+  return out;
+}
+
 const BADGE = {
   off: { text: "OFF", color: "#3f3f46" },
   on: { text: "ON", color: "#e0532c" },
@@ -483,9 +616,16 @@ const handlers = {
   },
 
   async SETTINGS_CHANGED(msg, sender) {
-    const payload =
-      msg.payload && typeof msg.payload === "object" ? msg.payload : {};
-    const merged = { ...(await readPrefs()), ...payload };
+    // Untrusted input: allowlist + clamp before anything reaches storage.
+    const payload = sanitizeSettingsPatch(msg.payload);
+    const current = await readPrefs();
+    const merged = {
+      ...current,
+      ...payload,
+      gesture: { ...(current.gesture ?? {}), ...(payload.gesture ?? {}) },
+      audio: { ...(current.audio ?? {}), ...(payload.audio ?? {}) },
+      camera: { ...(current.camera ?? {}), ...(payload.camera ?? {}) },
+    };
     // Flat mirrors keep the popup / content-script / studio readers in sync
     // without each having to understand the nested schema.
     await chrome.storage.sync.set({
