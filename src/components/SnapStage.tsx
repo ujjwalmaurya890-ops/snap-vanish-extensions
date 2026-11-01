@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import type { MutableRefObject } from "react";
 import {
   Camera,
   CameraOff,
@@ -10,8 +11,10 @@ import {
 } from "lucide-react";
 import {
   DustScene,
+  createRenderOptions,
   playSnap,
   type Direction,
+  type EffectRenderOptions,
   type EffectType,
 } from "../lib/dust";
 import { FramePerformanceTracker } from "../lib/diagnostics";
@@ -95,13 +98,16 @@ const EFFECT_LABELS: Record<EffectType, string> = {
   "light-burst": "ENERGY BURST",
 };
 
+/** Telemetry publish cadence for FPS / render-ms / particle count. */
+const METRICS_INTERVAL_MS = 500;
+
 const RESOLUTION_MAP = {
   "640x360": { width: 640, height: 360 },
   "1280x720": { width: 1280, height: 720 },
   "1920x1080": { width: 1920, height: 1080 },
 } as const;
 
-export default function SnapStage({
+function SnapStageImpl({
   enabled,
   duration,
   direction,
@@ -138,11 +144,46 @@ export default function SnapStage({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const analysisCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const sceneRef = useRef<DustScene | null>(null);
-  const bgReconstructorRef = useRef(new BackgroundReconstructor(320, 180));
-  const handServiceRef = useRef(new HandLandmarkService());
+  /**
+   * `useRef(new X())` evaluates `new X()` on *every* render and throws the
+   * instance away — five heavyweight objects (MediaPipe service, audio engine,
+   * background reconstructor, perf tracker) were being constructed per render
+   * while the webcam was live (~60×/s). Lazy initialisation fixes that.
+   */
+  const lazyRef = <T,>(ref: MutableRefObject<T | null>, make: () => T): T => {
+    if (!ref.current) ref.current = make();
+    return ref.current;
+  };
+  const bgReconstructorRef = useRef<BackgroundReconstructor | null>(null);
+  const handServiceRef = useRef<HandLandmarkService | null>(null);
   const gestureDetectorRef = useRef<SnapGestureDetector | null>(null);
-  const audioEngineRef = useRef(new LiveAudioConfirmationEngine());
-  const perfRef = useRef(new FramePerformanceTracker());
+  const audioEngineRef = useRef<LiveAudioConfirmationEngine | null>(null);
+  const perfRef = useRef<FramePerformanceTracker | null>(null);
+  const stablePerf = lazyRef(perfRef, () => new FramePerformanceTracker());
+  const stableAudioEngine = lazyRef(audioEngineRef, () => new LiveAudioConfirmationEngine());
+  const stableHandService = lazyRef(handServiceRef, () => new HandLandmarkService());
+  const stableBgReconstructor = lazyRef(
+    bgReconstructorRef,
+    () => new BackgroundReconstructor(320, 180),
+  );
+
+  /** Latest non-visual callbacks, read by the render loop without restarting it. */
+  const cbRef = useRef({
+    onStatus,
+    onMetrics,
+    onAudioMonitorChange,
+    onDetectionDiagnostics,
+    onGestureTriggered,
+    onEmergencyRestore,
+  });
+  cbRef.current = {
+    onStatus,
+    onMetrics,
+    onAudioMonitorChange,
+    onDetectionDiagnostics,
+    onGestureTriggered,
+    onEmergencyRestore,
+  };
   const audioClickCtxRef = useRef<AudioContext | null>(null);
   const wakeLoopRef = useRef<(() => void) | null>(null);
 
@@ -214,6 +255,13 @@ export default function SnapStage({
   const soundRef = useRef(sound);
   soundRef.current = sound;
 
+  /** Last values published to React state — suppresses no-op renders. */
+  const lastPublishedRef = useRef<{
+    fps: number | null;
+    ms: number | null;
+    count: number;
+  }>({ fps: null, ms: null, count: -1 });
+
   // Keep gesture detector synced with settings
   useEffect(() => {
     if (!gestureDetectorRef.current) {
@@ -279,7 +327,7 @@ export default function SnapStage({
       }
       vid.srcObject = null;
     }
-    audioEngineRef.current.stop();
+    stableAudioEngine.stop();
     latestLandmarksRef.current = { landmarks: null, isCandidate: false };
     setLiveCameraActive(false);
     setCameraResolution(null);
@@ -351,7 +399,7 @@ export default function SnapStage({
 
       // Start live audio confirmation monitor if enabled
       if (fullSettings?.audio.enabled && fullSettings?.gesture.requireAudioConfirm) {
-        const audioRes = await audioEngineRef.current.start({
+        const audioRes = await stableAudioEngine.start({
           preferredDeviceId: fullSettings.audio.preferredDeviceId || undefined,
           sensitivityDb: fullSettings.audio.sensitivityDb,
           onDisconnected: () => {
@@ -366,7 +414,7 @@ export default function SnapStage({
       // Initialize local MediaPipe HandLandmarker if automatic gesture detection is enabled
       if (fullSettings?.gesture.enabled !== false) {
         setModelLoadText("Loading local MediaPipe HandLandmarker…");
-        const initRes = await handServiceRef.current.initialize({
+        const initRes = await stableHandService.initialize({
           minConfidence: fullSettings?.gesture.minHandConfidence ?? 0.62,
           enableSegmentation:
             fullSettings?.camera.backgroundMode === "ai-segmentation",
@@ -448,7 +496,7 @@ export default function SnapStage({
     if (!actx) return;
     actx.drawImage(vid, 0, 0, ac.width, ac.height);
     const frame = actx.getImageData(0, 0, ac.width, ac.height);
-    bgReconstructorRef.current.captureCleanPlate(frame);
+    stableBgReconstructor.captureCleanPlate(frame);
     setPlateCapturedBadge(true);
   }, [liveCameraActive]);
 
@@ -494,14 +542,14 @@ export default function SnapStage({
     const currentFrame = actx.getImageData(0, 0, ac.width, ac.height);
     const segMask =
       settingsRef.current.backgroundMode === "ai-segmentation"
-        ? handServiceRef.current.segmentVideoFrame(vid)
+        ? stableHandService.segmentVideoFrame(vid)
         : null;
     const { imageData: plate } =
-      bgReconstructorRef.current.resolveBackgroundPlate(
+      stableBgReconstructor.resolveBackgroundPlate(
         settingsRef.current.backgroundMode,
         currentFrame,
       );
-    const alpha = bgReconstructorRef.current.computeForegroundAlpha(
+    const alpha = stableBgReconstructor.computeForegroundAlpha(
       currentFrame,
       plate,
       segMask,
@@ -567,6 +615,10 @@ export default function SnapStage({
     let running = false;
     let frameCounter = 0;
     let lastInferenceAt = 0;
+    let lastMetricsPublishAt = 0;
+
+    /** Reused every frame — the draw loop must not allocate. */
+    const renderOptions: EffectRenderOptions = createRenderOptions();
 
     const drawSingleFrame = (now: number) => {
       const cfg = settingsRef.current;
@@ -592,7 +644,7 @@ export default function SnapStage({
           t = ph.to;
           isAnimating = false;
           setStatus(next);
-          onStatus(next);
+          cbRef.current.onStatus(next);
         }
       }
 
@@ -606,10 +658,10 @@ export default function SnapStage({
 
         // Poll live audio confirmation meter
         const audioSnap = cfg.audio?.enabled
-          ? audioEngineRef.current.poll(now)
+          ? stableAudioEngine.poll(now)
           : null;
         if (audioSnap && frameCounter % 6 === 0) {
-          onAudioMonitorChange?.(
+          cbRef.current.onAudioMonitorChange?.(
             audioSnap.active,
             audioSnap.levelPercent,
             audioSnap.currentDb,
@@ -641,7 +693,7 @@ export default function SnapStage({
             const actx = ac.getContext("2d");
             if (actx) {
               actx.drawImage(liveVid, 0, 0, 320, 180);
-              bgReconstructorRef.current.ingestLiveFrame(
+              stableBgReconstructor.ingestLiveFrame(
                 actx.getImageData(0, 0, 320, 180),
               );
             }
@@ -649,9 +701,9 @@ export default function SnapStage({
 
           if (
             cfg.gesture?.enabled !== false &&
-            handServiceRef.current.currentStatus === "ready"
+            stableHandService.currentStatus === "ready"
           ) {
-            const inf = handServiceRef.current.detectVideoFrame(liveVid, now);
+            const inf = stableHandService.detectVideoFrame(liveVid, now);
             const detector = gestureDetectorRef.current;
             if (inf.handDetected && inf.landmarks && detector) {
               const evalRes = detector.evaluateLandmarks(inf.landmarks, now, {
@@ -671,7 +723,7 @@ export default function SnapStage({
               };
 
               if (frameCounter % 4 === 0 || evalRes.triggered) {
-                onDetectionDiagnostics?.({
+                cbRef.current.onDetectionDiagnostics?.({
                   modelStatus: "ready",
                   modelLoadProgress: 100,
                   modelError: null,
@@ -704,7 +756,7 @@ export default function SnapStage({
 
               if (evalRes.triggered) {
                 const mapping = cfg.gesture?.actionMapping ?? "toggle-vanish";
-                onGestureTriggered?.(mapping);
+                cbRef.current.onGestureTriggered?.(mapping);
                 if (mapping === "toggle-vanish") {
                   fire();
                 } else if (mapping === "vanish-only") {
@@ -717,7 +769,7 @@ export default function SnapStage({
               const phase = detector.notifyNoHand(now);
               latestLandmarksRef.current = { landmarks: null, isCandidate: false };
               if (frameCounter % 10 === 0) {
-                onDetectionDiagnostics?.({
+                cbRef.current.onDetectionDiagnostics?.({
                   modelStatus: "ready",
                   modelLoadProgress: 100,
                   modelError: null,
@@ -744,18 +796,17 @@ export default function SnapStage({
         }
       }
 
-      sceneRef.current?.render(ctx, t, cfg.direction, cfg.duration, {
-        effect: cfg.effect,
-        speed: cfg.speed,
-        particleSize: cfg.particleSize,
-        density: cfg.density,
-        colorAccent: cfg.colorAccent,
-        intensity: cfg.intensity,
-        motionSmoothness: cfg.motionSmoothness,
-        lowPowerMode: cfg.lowPowerMode,
-        liveVideoSource: liveVid,
-        mirrorLiveVideo: cfg.mirrorPreview,
-      });
+      renderOptions.effect = cfg.effect;
+      renderOptions.speed = cfg.speed;
+      renderOptions.particleSize = cfg.particleSize;
+      renderOptions.density = cfg.density;
+      renderOptions.colorAccent = cfg.colorAccent;
+      renderOptions.intensity = cfg.intensity;
+      renderOptions.motionSmoothness = cfg.motionSmoothness;
+      renderOptions.lowPowerMode = cfg.lowPowerMode;
+      renderOptions.liveVideoSource = liveVid;
+      renderOptions.mirrorLiveVideo = cfg.mirrorPreview;
+      sceneRef.current?.render(ctx, t, cfg.direction, cfg.duration, renderOptions);
 
       // Draw 21-point hand landmark skeleton overlay when enabled on live camera
       if (
@@ -779,20 +830,31 @@ export default function SnapStage({
 
       const renderEnd = performance.now();
       if (isAnimating || liveCameraActive) {
-        perfRef.current.recordFrame(renderStart, renderEnd);
+        stablePerf.recordFrame(renderStart, renderEnd);
         frameCounter += 1;
-        if (frameCounter % 12 === 0) {
-          const fps = perfRef.current.getMeasuredFps();
-          const ms = perfRef.current.getMeasuredRenderMs();
+        // Telemetry is a *display* concern: publish at most twice a second and
+        // only when the value actually changed. Publishing every 12th frame (or
+        // worse, every frame while idle-but-live) re-rendered this 1 100-line
+        // component — and its parent dashboard — at up to 60 Hz.
+        if (renderEnd - lastMetricsPublishAt >= METRICS_INTERVAL_MS) {
+          lastMetricsPublishAt = renderEnd;
+          const fps = stablePerf.getMeasuredFps();
+          const ms = stablePerf.getMeasuredRenderMs();
           const activeCount = sceneRef.current?.particleCount ?? 0;
-          setMeasuredFps(fps);
-          setMeasuredMs(ms);
-          setCount(activeCount);
-          onMetrics?.({ fps, renderMs: ms, particles: activeCount });
+          if (fps !== lastPublishedRef.current.fps) {
+            lastPublishedRef.current.fps = fps;
+            setMeasuredFps(fps);
+          }
+          if (ms !== lastPublishedRef.current.ms) {
+            lastPublishedRef.current.ms = ms;
+            setMeasuredMs(ms);
+          }
+          if (activeCount !== lastPublishedRef.current.count) {
+            lastPublishedRef.current.count = activeCount;
+            setCount(activeCount);
+          }
+          cbRef.current.onMetrics?.({ fps, renderMs: ms, particles: activeCount });
         }
-      } else {
-        const activeCount = sceneRef.current?.particleCount ?? 0;
-        setCount(activeCount);
       }
 
       if (isAnimating || liveCameraActive) {
@@ -813,7 +875,7 @@ export default function SnapStage({
 
     const onVisibility = () => {
       if (!document.hidden) {
-        perfRef.current.reset();
+        stablePerf.reset();
         wake();
       }
     };
@@ -824,17 +886,10 @@ export default function SnapStage({
       cancelAnimationFrame(raf);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [
-    ready,
-    liveCameraActive,
-    showHandOverlay,
-    fire,
-    onStatus,
-    onMetrics,
-    onAudioMonitorChange,
-    onDetectionDiagnostics,
-    onGestureTriggered,
-  ]);
+    // Intentionally narrow: callbacks are read through `cbRef`, so a parent
+    // re-render can no longer tear down and restart the rAF loop mid-transition
+    // (previously every parent render cancelled the in-flight animation frame).
+  }, [ready, liveCameraActive, showHandOverlay]);
 
   // Repaint resting static frame whenever visual parameters change
   useEffect(() => {
@@ -854,9 +909,11 @@ export default function SnapStage({
 
   // Complete cleanup of camera, microphone, AudioContext, and MediaPipe WASM on unmount
   useEffect(() => {
-    const handSvc = handServiceRef.current;
-    const audioEng = audioEngineRef.current;
+    // Resolve lazily at teardown: these instances only exist if the user actually
+    // enabled the live webcam during this mount.
     return () => {
+      const handSvc = handServiceRef.current;
+      const audioEng = audioEngineRef.current;
       const vid = videoRef.current;
       if (vid && vid.srcObject) {
         for (const tr of (vid.srcObject as MediaStream).getTracks()) {
@@ -867,8 +924,8 @@ export default function SnapStage({
           }
         }
       }
-      audioEng.stop();
-      handSvc.dispose();
+      audioEng?.stop();
+      handSvc?.dispose();
       if (
         audioClickCtxRef.current &&
         audioClickCtxRef.current.state !== "closed"
@@ -1100,3 +1157,11 @@ export default function SnapStage({
     </div>
   );
 }
+
+/**
+ * Memoised: the parent dashboard re-renders on every settings keystroke and on
+ * every audio-meter tick. Without `memo` each of those re-rendered this whole
+ * stage tree (canvas element + telemetry bars + 6 buttons).
+ */
+const SnapStage = memo(SnapStageImpl);
+export default SnapStage;

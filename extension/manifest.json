@@ -21,10 +21,22 @@
     }
   },
   "options_page": "studio/index.html",
-  "permissions": ["activeTab", "storage"],
+
+  "permissions": ["storage", "offscreen"],
+
+  "host_permissions": [
+    "https://meet.google.com/*",
+    "https://teams.microsoft.com/*",
+    "https://teams.live.com/*",
+    "https://*.zoom.us/wc/*",
+    "https://app.zoom.us/wc/*"
+  ],
+
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
+
   "content_scripts": [
     {
       "matches": [
@@ -36,7 +48,8 @@
       ],
       "js": ["content/main-world-bridge.js"],
       "run_at": "document_start",
-      "world": "MAIN"
+      "world": "MAIN",
+      "all_frames": false
     },
     {
       "matches": [
@@ -49,21 +62,30 @@
       "js": ["content/snap-vanish.js"],
       "css": ["content/snap-vanish.css"],
       "run_at": "document_idle",
-      "world": "ISOLATED"
+      "world": "ISOLATED",
+      "all_frames": false
     }
   ],
+
   "web_accessible_resources": [
     {
-      "resources": ["models/*", "wasm/*", "vendor/*"],
+      "resources": [
+        "models/hand_landmarker.task",
+        "wasm/vision_wasm_module_internal.js",
+        "wasm/vision_wasm_module_internal.wasm",
+        "vendor/vision_bundle.mjs"
+      ],
       "matches": [
         "https://meet.google.com/*",
         "https://teams.microsoft.com/*",
         "https://teams.live.com/*",
         "https://*.zoom.us/wc/*",
         "https://app.zoom.us/wc/*"
-      ]
+      ],
+      "use_dynamic_url": false
     }
   ],
+
   "commands": {
     "toggle-snap": {
       "suggested_key": {
@@ -94,7 +116,8 @@
       "description": "Emergency restore live camera feed and unmute microphone"
     }
   },
+
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'"
   }
 }

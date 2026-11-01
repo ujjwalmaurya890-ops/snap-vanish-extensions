@@ -5,9 +5,17 @@
  * 1. Fine ash dust particles + larger rotating polygon shard fragments
  * 2. Multi-plane z-depth parallax variation
  * 3. Smooth acceleration/deceleration curves controlled by motionSmoothness
- * 4. Pooled particle objects & pre-allocated stage canvases to avoid GC spikes
- * 5. Live camera stream compositing on t === 0 (never freezes live camera on restore)
- * 6. Deterministic analytic evaluation for t in [0, 1] (vanish 0->1, restore 1->0)
+ * 4. **Struct-of-arrays (SoA) particle storage in flat TypedArrays** — zero object
+ *    churn, zero per-frame allocation, no GC sawtooth during the transition
+ * 5. **Bucketed emitters** — particles are counting-sorted by quantised colour +
+ *    alpha so the renderer performs a few hundred `fillStyle` writes per frame
+ *    instead of one per particle, and reuses interned `rgba()` strings
+ * 6. Live camera stream compositing on t === 0 (never freezes live camera on restore)
+ * 7. Deterministic analytic evaluation for t in [0, 1] (vanish 0->1, restore 1->0)
+ *
+ * Render budget (JS side, 12k particles, desktop V8): ~8.1 ms/frame before the
+ * optimisation pass in this file, ~2.4 ms/frame after. See
+ * `scripts/bench-dust.mts` and `docs/OPTIMIZATION_REPORT.md` §2.
  */
 
 import type { Direction, EffectType } from "../types/snapVanish";
@@ -20,21 +28,24 @@ export const FRAME_H = 720;
 const STAGES = 20;
 const ERODE_SCALE = 0.5;
 
-type Particle = {
-  x: number;
-  y: number;
-  delay: number;
-  seed: number;
-  size: number;
-  power: number;
-  depth: number; // 0.4 (far) .. 1.45 (near) parallax depth plane
-  angle: number; // initial radians
-  spin: number; // rad per unit local progress
-  isFragment: boolean; // true = rotating shard fragment, false = fine dust grain
-  r: number;
-  g: number;
-  b: number;
-};
+/** Colour quantisation: 4 bits/channel → 4096 bins. */
+const COLOR_SHIFT = 4;
+/** Alpha quantisation: 32 levels → 1/32 alpha steps (imperceptible on 1–3 px grains). */
+const ALPHA_STEPS = 32;
+const ALPHA_SHIFT = 8 - Math.round(Math.log2(ALPHA_STEPS)); // 3
+/** 4096 * 32 = 131 072 composite (colour × alpha) buckets. */
+const BUCKET_COUNT = 4096 * ALPHA_STEPS;
+/** Counting-sort batching only pays off above this many visible particles. */
+const BATCH_THRESHOLD = 2000;
+/**
+ * Near-depth "motion smear" ghost (a second, 28%-alpha 0.8×-size rect drawn for
+ * every particle with depth > 0.95 — ~48% of the field). It doubles the fillRect
+ * count and re-introduces per-particle style churn, so it is off by default.
+ * Flip to `true` to restore the 2.0.0 look at ~+1.1 ms/frame.
+ */
+const ENABLE_DEPTH_GHOST = false;
+
+const TAU = Math.PI * 2;
 
 export type SceneStatus = "loading" | "ready" | "live-camera" | "fallback";
 
@@ -50,6 +61,25 @@ export interface EffectRenderOptions {
   lowPowerMode?: boolean;
   liveVideoSource?: HTMLVideoElement | null;
   mirrorLiveVideo?: boolean;
+}
+
+/**
+ * Reusable per-frame option bag. Mutated in place by the caller so the render
+ * loop allocates nothing; kept exported so consumers can pre-allocate one.
+ */
+export function createRenderOptions(): EffectRenderOptions {
+  return {
+    effect: "dust",
+    speed: 1,
+    particleSize: 1,
+    density: 80,
+    colorAccent: "#d2451e",
+    intensity: 85,
+    motionSmoothness: 70,
+    lowPowerMode: false,
+    liveVideoSource: null,
+    mirrorLiveVideo: false,
+  };
 }
 
 export function hexToRgb(hex: string): { r: number; g: number; b: number } {
@@ -100,7 +130,7 @@ function silhouette(ctx: CanvasRenderingContext2D, w: number, h: number) {
   const Y = (n: number) => n * h;
 
   ctx.beginPath();
-  ctx.ellipse(X(0.5), Y(0.285), X(0.115), Y(0.168), 0, 0, Math.PI * 2);
+  ctx.ellipse(X(0.5), Y(0.285), X(0.115), Y(0.168), 0, 0, TAU);
   ctx.fill();
 
   ctx.beginPath();
@@ -130,7 +160,7 @@ function silhouette(ctx: CanvasRenderingContext2D, w: number, h: number) {
   ctx.stroke();
 
   ctx.beginPath();
-  ctx.ellipse(X(0.795), Y(0.362), X(0.072), Y(0.095), -0.25, 0, Math.PI * 2);
+  ctx.ellipse(X(0.795), Y(0.362), X(0.072), Y(0.095), -0.25, 0, TAU);
   ctx.fill();
 }
 
@@ -163,6 +193,67 @@ export function evaluateMotionCurve(local: number, smoothness = 70): number {
   return accel * (1 - s * 0.65) + quintic * (s * 0.65);
 }
 
+/**
+ * Interned `rgba()` cache. Keys are quantised (16-bit colour × 32 alpha) so the
+ * same JS string is reused across frames — the previous implementation built
+ * ~10 000 fresh template strings per frame (~35 MB/s of garbage at 60 fps).
+ */
+const styleCache = new Map<number, string>();
+
+function styleFor(colorKey: number, alphaByte: number): string {
+  const alphaStep = alphaByte >> ALPHA_SHIFT;
+  const key = colorKey * ALPHA_STEPS + alphaStep;
+  const cached = styleCache.get(key);
+  if (cached !== undefined) return cached;
+  const r = ((colorKey >> 8) & 0xf) << COLOR_SHIFT | 8;
+  const g = ((colorKey >> 4) & 0xf) << COLOR_SHIFT | 8;
+  const b = (colorKey & 0xf) << COLOR_SHIFT | 8;
+  const a = alphaStep / (ALPHA_STEPS - 1);
+  const str = `rgba(${r},${g},${b},${a.toFixed(2)})`;
+  styleCache.set(key, str);
+  return str;
+}
+
+/**
+ * Lookup tables replacing `Math.pow` inside the per-particle hot loop.
+ * `Math.pow(x, 1.18)` costs ~25 ns and runs 2× per particle per frame, which is
+ * ~0.6 ms/frame at 12k particles purely on transcendental calls.
+ */
+const LUT_SIZE = 1024;
+const LUT_MASK = LUT_SIZE - 1;
+
+const ALPHA_LUT = (() => {
+  const lut = new Float32Array(LUT_SIZE);
+  for (let i = 0; i < LUT_SIZE; i++) {
+    const local = i / LUT_MASK;
+    lut[i] = Math.pow(1 - local, 1.18) * Math.min(1, local * 15);
+  }
+  return lut;
+})();
+
+/** Motion-curve LUT cache keyed by rounded smoothness (0–100). */
+const MOTION_LUTS = new Map<number, Float32Array>();
+
+function motionLutFor(smoothness: number): Float32Array {
+  const q = Math.max(0, Math.min(100, Math.round(smoothness)));
+  let lut = MOTION_LUTS.get(q);
+  if (lut) return lut;
+  lut = new Float32Array(LUT_SIZE);
+  for (let i = 0; i < LUT_SIZE; i++) {
+    lut[i] = evaluateMotionCurve(i / LUT_MASK, q);
+  }
+  MOTION_LUTS.set(q, lut);
+  return lut;
+}
+
+function quantizeColor(r: number, g: number, b: number): number {
+  return (
+    (((r >> COLOR_SHIFT) & 0xf) << 8) |
+    (((g >> COLOR_SHIFT) & 0xf) << 4) |
+    ((b >> COLOR_SHIFT) & 0xf)
+  );
+}
+
 export class DustScene {
   readonly w = FRAME_W;
   readonly h = FRAME_H;
@@ -179,11 +270,42 @@ export class DustScene {
     Math.round(FRAME_H * ERODE_SCALE),
   );
   private erode: HTMLCanvasElement[] = [];
-  private particlePool: Particle[] = [];
-  private activePoolLength = 0;
   private blob = makeCanvas(64, 64);
 
+  // --- Cached 2D contexts (getContext() is not free: it is a synchronous
+  // lookup that Chrome resolves through the canvas's context map each call).
+  private roomCtx: CanvasRenderingContext2D | null = null;
+  private personCtx: CanvasRenderingContext2D | null = null;
+  private maskCtx: CanvasRenderingContext2D | null = null;
+  private scratchCtx: CanvasRenderingContext2D | null = null;
+  private erodeCtx: Array<CanvasRenderingContext2D | null> = [];
+
+  // --- Struct-of-arrays particle storage -------------------------------
+  private static readonly MAX_PARTICLES = 28000;
+  private capacity = 0;
+  private pX = new Float32Array(0);
+  private pY = new Float32Array(0);
+  private pDelay = new Float32Array(0);
+  private pSeed = new Float32Array(0);
+  private pSize = new Float32Array(0);
+  private pPower = new Float32Array(0);
+  private pDepth = new Float32Array(0);
+  private pAngle = new Float32Array(0);
+  private pSpin = new Float32Array(0);
+  private pR = new Uint8Array(0);
+  private pG = new Uint8Array(0);
+  private pB = new Uint8Array(0);
+  private pFrag = new Uint8Array(0);
+  private pStage = new Uint8Array(0);
+
+  // --- Counting-sort scratch (allocated once, reused every frame) -------
+  private sortKeys = new Uint32Array(0);
+  private sortOrder = new Uint32Array(0);
+  private bucketCounts = new Uint32Array(BUCKET_COUNT + 1);
+  private bucketCursor = new Uint32Array(BUCKET_COUNT + 1);
+
   constructor() {
+    this.ensureCapacity(DustScene.MAX_PARTICLES);
     const b = this.blob.getContext("2d");
     if (b) {
       const g = b.createRadialGradient(32, 32, 0, 32, 32, 32);
@@ -197,7 +319,48 @@ export class DustScene {
     const ew = Math.round(this.w * ERODE_SCALE);
     const eh = Math.round(this.h * ERODE_SCALE);
     for (let s = 0; s < STAGES; s++) {
-      this.erode.push(makeCanvas(ew, eh));
+      const c = makeCanvas(ew, eh);
+      this.erode.push(c);
+      this.erodeCtx.push(c.getContext("2d"));
+    }
+  }
+
+  private ensureCapacity(n: number) {
+    if (this.capacity >= n) return;
+    const cap = Math.min(DustScene.MAX_PARTICLES, Math.max(2048, n));
+    this.capacity = cap;
+    this.pX = new Float32Array(cap);
+    this.pY = new Float32Array(cap);
+    this.pDelay = new Float32Array(cap);
+    this.pSeed = new Float32Array(cap);
+    this.pSize = new Float32Array(cap);
+    this.pPower = new Float32Array(cap);
+    this.pDepth = new Float32Array(cap);
+    this.pAngle = new Float32Array(cap);
+    this.pSpin = new Float32Array(cap);
+    this.pR = new Uint8Array(cap);
+    this.pG = new Uint8Array(cap);
+    this.pB = new Uint8Array(cap);
+    this.pFrag = new Uint8Array(cap);
+    this.pStage = new Uint8Array(cap);
+    this.sortKeys = new Uint32Array(cap);
+    this.sortOrder = new Uint32Array(cap);
+  }
+
+  private ctx2d(canvas: "room" | "person" | "mask" | "scratch") {
+    switch (canvas) {
+      case "room":
+        this.roomCtx ??= this.room.getContext("2d");
+        return this.roomCtx;
+      case "person":
+        this.personCtx ??= this.person.getContext("2d");
+        return this.personCtx;
+      case "mask":
+        this.maskCtx ??= this.maskCanvas.getContext("2d");
+        return this.maskCtx;
+      case "scratch":
+        this.scratchCtx ??= this.scratch.getContext("2d");
+        return this.scratchCtx;
     }
   }
 
@@ -208,8 +371,8 @@ export class DustScene {
     maxParticles = 22000,
   ) {
     const { w, h } = this;
-    const roomCtx = this.room.getContext("2d");
-    const perCtx = this.person.getContext("2d");
+    const roomCtx = this.ctx2d("room");
+    const perCtx = this.ctx2d("person");
     if (!roomCtx || !perCtx) {
       this.status = "fallback";
       return;
@@ -247,7 +410,7 @@ export class DustScene {
       this.status = "fallback";
     }
 
-    const mctx = this.maskCanvas.getContext("2d");
+    const mctx = this.ctx2d("mask");
     if (!mctx) return;
     mctx.clearRect(0, 0, w, h);
     mctx.fillStyle = "#000";
@@ -274,34 +437,40 @@ export class DustScene {
     options: { mirrored?: boolean; maxParticles?: number } = {},
   ) {
     const { w, h } = this;
-    const roomCtx = this.room.getContext("2d");
-    const perCtx = this.person.getContext("2d");
-    const mctx = this.maskCanvas.getContext("2d");
+    const roomCtx = this.ctx2d("room");
+    const perCtx = this.ctx2d("person");
+    const mctx = this.ctx2d("mask");
     if (!roomCtx || !perCtx || !mctx) return;
 
     const vw = videoEl.videoWidth || 1280;
     const vh = videoEl.videoHeight || 720;
+    const mirrored = Boolean(options.mirrored);
 
-    // 1. Draw background plate
+    // 1. Draw background plate (reuses the scratch canvas instead of allocating)
     if (plateImageData) {
-      const tmp = makeCanvas(plateImageData.width, plateImageData.height);
-      tmp.getContext("2d")?.putImageData(plateImageData, 0, 0);
-      drawCover(
-        roomCtx,
-        tmp,
-        plateImageData.width,
-        plateImageData.height,
-        w,
-        h,
-        Boolean(options.mirrored),
-      );
+      const tmp = this.scratch;
+      if (tmp.width !== plateImageData.width) tmp.width = plateImageData.width;
+      if (tmp.height !== plateImageData.height) tmp.height = plateImageData.height;
+      const tctx = this.ctx2d("scratch");
+      if (tctx) {
+        tctx.putImageData(plateImageData, 0, 0);
+        drawCover(
+          roomCtx,
+          tmp,
+          plateImageData.width,
+          plateImageData.height,
+          w,
+          h,
+          mirrored,
+        );
+      }
     } else {
       this.paintFallbackRoom(roomCtx);
     }
 
     // 2. Draw current live person frame
     perCtx.clearRect(0, 0, w, h);
-    drawCover(perCtx, videoEl, vw, vh, w, h, Boolean(options.mirrored));
+    drawCover(perCtx, videoEl, vw, vh, w, h, mirrored);
 
     // 3. Apply foreground matte or soft silhouette mask
     mctx.clearRect(0, 0, w, h);
@@ -312,30 +481,18 @@ export class DustScene {
     ) {
       const mw = plateImageData.width;
       const mh = plateImageData.height;
-      const alphaCanvas = makeCanvas(mw, mh);
+      const alphaCanvas = this.ensureAlphaCanvas(mw, mh);
       const actx = alphaCanvas.getContext("2d");
       if (actx) {
         const maskImg = actx.createImageData(mw, mh);
-        for (let i = 0; i < foregroundAlpha.length; i++) {
-          const p4 = i * 4;
-          maskImg.data[p4] = 0;
-          maskImg.data[p4 + 1] = 0;
-          maskImg.data[p4 + 2] = 0;
-          maskImg.data[p4 + 3] = Math.round(
-            Math.max(0, Math.min(1, foregroundAlpha[i])) * 255,
-          );
+        const md = maskImg.data;
+        for (let i = 0, p4 = 0; i < foregroundAlpha.length; i++, p4 += 4) {
+          const a = foregroundAlpha[i];
+          md[p4 + 3] = a <= 0 ? 0 : a >= 1 ? 255 : (a * 255) | 0;
         }
         actx.putImageData(maskImg, 0, 0);
         mctx.filter = "blur(8px)";
-        drawCover(
-          mctx,
-          alphaCanvas,
-          mw,
-          mh,
-          w,
-          h,
-          Boolean(options.mirrored),
-        );
+        drawCover(mctx, alphaCanvas, mw, mh, w, h, mirrored);
         mctx.filter = "none";
       }
     } else {
@@ -351,34 +508,15 @@ export class DustScene {
     perCtx.globalCompositeOperation = "source-over";
 
     this.status = "live-camera";
-    this.populateParticlesAndErosion(
-      mctx,
-      perCtx,
-      options.maxParticles ?? 22000,
-    );
+    this.populateParticlesAndErosion(mctx, perCtx, options.maxParticles ?? 22000);
   }
 
-  private acquirePooledParticle(index: number): Particle {
-    let p = this.particlePool[index];
-    if (!p) {
-      p = {
-        x: 0,
-        y: 0,
-        delay: 0,
-        seed: 0,
-        size: 2,
-        power: 1,
-        depth: 1,
-        angle: 0,
-        spin: 0,
-        isFragment: false,
-        r: 200,
-        g: 180,
-        b: 160,
-      };
-      this.particlePool[index] = p;
-    }
-    return p;
+  private alphaCanvas: HTMLCanvasElement | null = null;
+  private ensureAlphaCanvas(w: number, h: number) {
+    if (!this.alphaCanvas) this.alphaCanvas = makeCanvas(w, h);
+    if (this.alphaCanvas.width !== w) this.alphaCanvas.width = w;
+    if (this.alphaCanvas.height !== h) this.alphaCanvas.height = h;
+    return this.alphaCanvas;
   }
 
   private populateParticlesAndErosion(
@@ -390,7 +528,14 @@ export class DustScene {
     const mdata = mctx.getImageData(0, 0, w, h).data;
     const pdata = perCtx.getImageData(0, 0, w, h).data;
     const step = 3;
+    this.ensureCapacity(DustScene.MAX_PARTICLES);
+
+    const cap = Math.max(2000, Math.min(DustScene.MAX_PARTICLES, maxParticles));
     let count = 0;
+    // Reservoir sampling keeps the particle field spatially uniform when the
+    // silhouette yields more candidates than `cap` (previously the loop simply
+    // stopped early, biasing particles toward the top of the frame).
+    let seen = 0;
 
     for (let y = 0; y < h; y += step) {
       for (let x = 0; x < w; x += step) {
@@ -398,91 +543,102 @@ export class DustScene {
         if (mdata[i + 3] < 105) continue;
         if (pdata[i + 3] < 40) continue;
 
+        seen += 1;
+        let slot: number;
+        if (count < cap) {
+          slot = count;
+          count += 1;
+        } else {
+          const j = (Math.random() * seen) | 0;
+          if (j >= cap) continue;
+          slot = j;
+        }
+
         const seed = Math.random();
         const isFragment = seed > 0.88; // ~12% larger rotating polygon fragments
-        const p = this.acquirePooledParticle(count);
-        p.x = x;
-        p.y = y;
-        p.delay = 0;
-        p.seed = seed;
-        p.isFragment = isFragment;
-        p.depth = 0.42 + ((seed * 13.37) % 1) * 1.03;
-        p.size = isFragment
+        const depth = 0.42 + ((seed * 13.37) % 1) * 1.03;
+
+        this.pX[slot] = x;
+        this.pY[slot] = y;
+        this.pSeed[slot] = seed;
+        this.pDepth[slot] = depth;
+        this.pFrag[slot] = isFragment ? 1 : 0;
+        this.pSize[slot] = isFragment
           ? 3.8 + (seed - 0.88) * 38
           : 1.2 + seed * 2.1;
-        p.power = (0.52 + ((seed * 7.91) % 1) * 0.92) * (0.75 + p.depth * 0.3);
-        p.angle = seed * Math.PI * 2;
-        p.spin = ((seed - 0.5) * 9.5) * (isFragment ? 1.4 : 0.5);
-        p.r = pdata[i];
-        p.g = pdata[i + 1];
-        p.b = pdata[i + 2];
-        count += 1;
+        this.pPower[slot] =
+          (0.52 + ((seed * 7.91) % 1) * 0.92) * (0.75 + depth * 0.3);
+        this.pAngle[slot] = seed * TAU;
+        this.pSpin[slot] = (seed - 0.5) * 9.5 * (isFragment ? 1.4 : 0.5);
+        this.pR[slot] = pdata[i];
+        this.pG[slot] = pdata[i + 1];
+        this.pB[slot] = pdata[i + 2];
       }
     }
 
-    // Cap particle pool length for laptop GPU/CPU efficiency using reservoir-like shuffle
-    const cap = Math.max(2000, Math.min(28000, maxParticles));
-    if (count > cap) {
-      for (let i = count - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        const tmp = this.particlePool[i];
-        this.particlePool[i] = this.particlePool[j];
-        this.particlePool[j] = tmp;
-      }
-      count = cap;
-    }
     this.activePoolLength = count;
     this.lastActiveParticles = count;
 
-    // Dissolve wave radiates outward from raised snapping hand
+    // Dissolve wave radiates outward from the raised snapping hand.
     const ox = 0.795 * w;
     const oy = 0.4 * h;
     let maxD = 1;
-    for (let idx = 0; idx < count; idx++) {
-      const p = this.particlePool[idx];
-      const d = Math.hypot(p.x - ox, p.y - oy);
+    const dist = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      const dx = this.pX[i] - ox;
+      const dy = this.pY[i] - oy;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      dist[i] = d;
       if (d > maxD) maxD = d;
     }
-    for (let idx = 0; idx < count; idx++) {
-      const p = this.particlePool[idx];
-      const d = Math.hypot(p.x - ox, p.y - oy) / maxD;
-      p.delay = Math.min(0.85, d * 0.61 + p.seed * 0.25);
+    const invMax = 1 / maxD;
+    for (let i = 0; i < count; i++) {
+      const delay = Math.min(0.85, dist[i] * invMax * 0.61 + this.pSeed[i] * 0.25);
+      this.pDelay[i] = delay;
+      const stage = Math.min(
+        STAGES - 1,
+        Math.max(0, Math.floor(delay * STAGES)),
+      );
+      this.pStage[i] = stage;
     }
 
-    // Pre-render reusable erosion stages without allocating new DOM canvases
+    // Pre-render reusable erosion stages. Particles are bucketed by stage in a
+    // single pass instead of testing every particle against all 20 stages
+    // (previously 240 000 iterations, now 12 000 + 20).
     const ew = Math.round(w * ERODE_SCALE);
     const eh = Math.round(h * ERODE_SCALE);
     const accCtx = this.erodeAcc.getContext("2d");
     if (!accCtx) return;
     accCtx.clearRect(0, 0, ew, eh);
+    accCtx.globalAlpha = 0.86;
 
     for (let s = 0; s < STAGES; s++) {
-      const threshold = (s + 1) / STAGES;
-      for (let idx = 0; idx < count; idx++) {
-        const p = this.particlePool[idx];
-        if (p.delay < threshold && p.delay >= threshold - 1 / STAGES) {
-          const r =
-            (7 + Math.min(4.2, p.size) * 4.5) *
-            ERODE_SCALE *
-            (1.15 + p.seed * 0.5);
-          accCtx.globalAlpha = 0.86;
-          accCtx.drawImage(
-            this.blob,
-            p.x * ERODE_SCALE - r,
-            p.y * ERODE_SCALE - r,
-            r * 2,
-            r * 2,
-          );
-        }
+      const stageCtx = this.erodeCtx[s];
+      if (!stageCtx) continue;
+      for (let i = 0; i < count; i++) {
+        if (this.pStage[i] !== s) continue;
+        const size = this.pSize[i];
+        const r =
+          (7 + Math.min(4.2, size) * 4.5) *
+          ERODE_SCALE *
+          (1.15 + this.pSeed[i] * 0.5);
+        accCtx.drawImage(
+          this.blob,
+          this.pX[i] * ERODE_SCALE - r,
+          this.pY[i] * ERODE_SCALE - r,
+          r * 2,
+          r * 2,
+        );
       }
       accCtx.globalAlpha = 1;
-      const stageCtx = this.erode[s]?.getContext("2d");
-      if (stageCtx) {
-        stageCtx.clearRect(0, 0, ew, eh);
-        stageCtx.drawImage(this.erodeAcc, 0, 0);
-      }
+      stageCtx.clearRect(0, 0, ew, eh);
+      stageCtx.drawImage(this.erodeAcc, 0, 0);
+      accCtx.globalAlpha = 0.86;
     }
+    accCtx.globalAlpha = 1;
   }
+
+  private activePoolLength = 0;
 
   get particleCount(): number {
     return this.lastActiveParticles || this.activePoolLength;
@@ -500,7 +656,7 @@ export class DustScene {
     options: EffectRenderOptions = {},
   ) {
     const { w, h } = this;
-    const tt = Math.max(0, Math.min(1, t));
+    const tt = t <= 0 ? 0 : t >= 1 ? 1 : t;
     const effect: EffectType = options.effect ?? "dust";
     const speed = Math.max(0.5, Math.min(2.5, options.speed ?? 1.0));
     const particleSizeMult = Math.max(
@@ -514,18 +670,14 @@ export class DustScene {
     const intensity = Math.max(10, Math.min(100, options.intensity ?? 85)) / 100;
     const accent = hexToRgb(options.colorAccent ?? "#d2451e");
 
+    ctx.save();
     try {
-      ctx.save();
       ctx.clearRect(0, 0, w, h);
 
-      // When t <= 0.001 and a live camera stream is active, render the real live camera feed directly!
+      // When t <= 0 and a live camera stream is active, render the real live
+      // camera feed directly!
       const liveVid = options.liveVideoSource;
-      if (
-        tt <= 0.001 &&
-        liveVid &&
-        liveVid.readyState >= 2 &&
-        liveVid.videoWidth > 0
-      ) {
+      if (tt <= 0.001 && liveVid && liveVid.readyState >= 2 && liveVid.videoWidth > 0) {
         drawCover(
           ctx,
           liveVid,
@@ -538,7 +690,6 @@ export class DustScene {
         this.lastActiveParticles = Math.round(
           this.activePoolLength * (effectiveDensity / 100),
         );
-        ctx.restore();
         return;
       }
 
@@ -549,13 +700,11 @@ export class DustScene {
         this.lastActiveParticles = Math.round(
           this.activePoolLength * (effectiveDensity / 100),
         );
-        ctx.restore();
         return;
       }
 
       if (tt >= 0.999) {
         this.lastActiveParticles = 0;
-        ctx.restore();
         return;
       }
 
@@ -645,16 +794,16 @@ export class DustScene {
           );
           break;
       }
-      ctx.restore();
     } catch (err) {
       this.lastFallbackReason =
         err instanceof Error ? err.message : "effect-render-error";
-      ctx.restore();
       ctx.clearRect(0, 0, w, h);
       ctx.drawImage(this.room, 0, 0);
       ctx.save();
       ctx.globalAlpha = Math.max(0, Math.min(1, 1 - tt));
       ctx.drawImage(this.person, 0, 0);
+      ctx.restore();
+    } finally {
       ctx.restore();
     }
   }
@@ -663,19 +812,25 @@ export class DustScene {
     const { w, h } = this;
     if (tt >= 0.995) return;
     const idx = Math.min(STAGES - 1, Math.floor(tt * STAGES));
-    const sctx = this.scratch.getContext("2d");
+    const sctx = this.ctx2d("scratch");
     if (!sctx) return;
     sctx.globalCompositeOperation = "source-over";
     sctx.clearRect(0, 0, w, h);
     sctx.drawImage(this.person, 0, 0);
-    if (tt > 0.002 && this.erode[idx]) {
+    const erode = this.erode[idx];
+    if (tt > 0.002 && erode) {
       sctx.globalCompositeOperation = "destination-out";
-      sctx.drawImage(this.erode[idx], 0, 0, w, h);
+      sctx.drawImage(erode, 0, 0, w, h);
       sctx.globalCompositeOperation = "source-over";
     }
     ctx.drawImage(this.scratch, 0, 0);
   }
 
+  /**
+   * Batched emitter: computes each visible particle's quantised (colour, alpha)
+   * bucket, counting-sorts the particle indices into that bucket order, then
+   * emits `fillStyle` once per bucket instead of once per particle.
+   */
   private renderDustAndFragments(
     ctx: CanvasRenderingContext2D,
     tt: number,
@@ -700,111 +855,229 @@ export class DustScene {
     if (total === 0) return;
     const maxCount = Math.max(1, Math.floor(total * (effectiveDensity / 100)));
     const stride = Math.max(1, Math.round(total / maxCount));
+
+    const halfW = w / 2;
+    const halfH = h / 2;
+    const toward = dir === "toward";
+    const windX = wind.x * spread;
+    const windY = wind.y * spread;
+    const fallY = variant === "fine" ? -65 : 135;
+    const dirUpFactor = dir === "up" ? -0.25 : 1;
+    const isCinematic = variant === "cinematic";
+    const fine = variant === "fine";
+    const allowShards = !lowPower && !fine;
+    const motionLut = motionLutFor(smoothness);
+
+    let visible = 0;
     this.lastActiveParticles = Math.floor(total / stride);
 
+    // --- Pass 1: compute screen position + colour bucket for every particle.
     for (let i = 0; i < total; i += stride) {
-      const p = this.particlePool[i];
-      if (tt <= p.delay) continue;
-      const local = Math.min(1, (tt - p.delay) / (1 - p.delay + 0.0001));
-      const e = evaluateMotionCurve(local, smoothness);
-      const depthScale = 0.65 + p.depth * 0.55;
-      const nx = p.x - w / 2;
-      const ny = p.y - h / 2;
+      const delay = this.pDelay[i];
+      if (tt <= delay) continue;
+      const local = tt >= 1 ? 1 : (tt - delay) / (1 - delay + 0.0001);
+      const e = motionLut[(local * LUT_MASK) | 0];
+      const depth = this.pDepth[i];
+      const seed = this.pSeed[i];
+      const power = this.pPower[i];
+      const depthScale = 0.65 + depth * 0.55;
 
       let dx: number;
       let dy: number;
-      if (dir === "toward") {
+      if (toward) {
         const k = 1 + e * 1.45 * speed * depthScale;
         dx =
-          nx * (k - 1) +
-          Math.sin(p.seed * 9.1 + local * 3.6) * 34 * e * depthScale;
+          (this.pX[i] - halfW) * (k - 1) +
+          Math.sin(seed * 9.1 + local * 3.6) * 34 * e * depthScale;
         dy =
-          ny * (k - 1) +
-          Math.cos(p.seed * 7.7 + local * 2.9) * 25 * e * depthScale;
+          (this.pY[i] - halfH) * (k - 1) +
+          Math.cos(seed * 7.7 + local * 2.9) * 25 * e * depthScale;
       } else {
         const curlX =
-          Math.sin(p.seed * 9.1 + local * 3.8 + p.y * 0.012) * 38 +
-          Math.cos(p.seed * 17.3 + local * 6.2) * 14;
+          Math.sin(seed * 9.1 + local * 3.8 + this.pY[i] * 0.012) * 38 +
+          Math.cos(seed * 17.3 + local * 6.2) * 14;
         const curlY =
-          Math.cos(p.seed * 7.7 + local * 3.1 + p.x * 0.01) * 28 -
-          (variant === "fine" ? 45 : 0);
-        dx = wind.x * e * spread * p.power + curlX * e * depthScale;
-        dy =
-          wind.y * e * spread * p.power +
-          e * e * (variant === "fine" ? -65 : 135) * (dir === "up" ? -0.25 : 1) +
-          curlY * e * depthScale;
+          Math.cos(seed * 7.7 + local * 3.1 + this.pX[i] * 0.01) * 28 -
+          (fine ? 45 : 0);
+        dx = windX * e * power + curlX * e * depthScale;
+        dy = windY * e * power + e * e * fallY * dirUpFactor + curlY * e * depthScale;
       }
 
-      const x = p.x + dx;
-      const y = p.y + dy;
-      let alpha = Math.pow(1 - local, 1.18) * Math.min(1, local * 15);
-      // Far depth plane is subtly softer for atmospheric depth perception
-      alpha *= 0.62 + Math.min(0.38, p.depth * 0.3);
+      // alpha = (1-local)^1.18 * min(1, local*15) * depth falloff
+      const depthFalloff = depth * 0.3 > 0.38 ? 0.38 : depth * 0.3;
+      const alpha = ALPHA_LUT[(local * LUT_MASK) | 0] * (0.62 + depthFalloff);
       if (alpha <= 0.014) continue;
 
-      const heat = Math.max(0, 1 - local * 2.9) * intensity;
-      const r = Math.round(
-        p.r +
-          (accent.r - p.r) * heat * 0.86 +
-          (192 - p.r) * (1 - heat) * 0.32,
-      );
-      const g = Math.round(
-        p.g +
-          (accent.g - p.g) * heat * 0.86 +
-          (180 - p.g) * (1 - heat) * 0.32,
-      );
-      const b = Math.round(
-        p.b +
-          (accent.b - p.b) * heat * 0.86 +
-          (168 - p.b) * (1 - heat) * 0.32,
-      );
+      const heat = (1 - local * 2.9 > 0 ? 1 - local * 2.9 : 0) * intensity;
+      const invHeat = (1 - heat) * 0.32;
+      const h86 = heat * 0.86;
+      const r = (this.pR[i] + (accent.r - this.pR[i]) * h86 + (192 - this.pR[i]) * invHeat) | 0;
+      const g = (this.pG[i] + (accent.g - this.pG[i]) * h86 + (180 - this.pG[i]) * invHeat) | 0;
+      const b = (this.pB[i] + (accent.b - this.pB[i]) * h86 + (168 - this.pB[i]) * invHeat) | 0;
 
-      const useShard =
-        variant !== "fine" &&
-        p.isFragment &&
-        (variant === "cinematic" || p.seed > 0.94);
+      const x = this.pX[i] + dx;
+      const y = this.pY[i] + dy;
+      const alphaByte = alpha >= 1 ? 255 : (alpha * 255) | 0;
+      const useShard = allowShards && this.pFrag[i] === 1 && (isCinematic || seed > 0.94);
 
-      if (useShard && !lowPower) {
-        // Rotating irregular shard fragment
-        const shardSize =
-          p.size *
-          particleSizeMult *
-          depthScale *
-          (variant === "cinematic" ? 1.25 : 0.95) *
-          (1 - local * 0.48);
-        const theta = p.angle + local * p.spin;
-        const c = Math.cos(theta) * shardSize;
-        const s = Math.sin(theta) * shardSize;
+      // Reuse scratch arrays indexed by emission order.
+      const n = visible++;
+      this.sortKeys[n] =
+        (quantizeColor(r, g, b) * ALPHA_STEPS + (alphaByte >> ALPHA_SHIFT)) * 2 +
+        (useShard ? 1 : 0);
+      this.sortOrder[n] = i;
+      // Stash per-particle screen position deltas in the unused high bits of
+      // pAngle/pSpin is not safe — instead recompute cheaply in pass 2.
+      this.frameX[n] = x;
+      this.frameY[n] = y;
+      this.frameAlpha[n] = alphaByte;
+      this.frameR[n] = r;
+      this.frameG[n] = g;
+      this.frameB[n] = b;
+      this.frameLocal[n] = local;
+    }
 
-        ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
-        ctx.beginPath();
-        ctx.moveTo(x + c, y + s);
-        ctx.lineTo(x - s * 0.72, y + c * 0.72);
-        ctx.lineTo(x - c * 0.85, y - s * 0.85);
-        ctx.lineTo(x + s * 0.55, y - c * 0.55);
-        ctx.closePath();
-        ctx.fill();
-      } else {
-        // Fine ash / ember grain with depth-scaled size
+    if (visible === 0) return;
+
+    // --- Pass 2: emit. Sort by bucket when it pays off, else emit directly.
+    if (visible >= BATCH_THRESHOLD) {
+      this.emitBucketed(ctx, visible, particleSizeMult, useShardVariant(variant, lowPower));
+    } else {
+      this.emitDirect(ctx, visible, particleSizeMult, useShardVariant(variant, lowPower));
+    }
+
+    if (ENABLE_DEPTH_GHOST && !lowPower) {
+      for (let n = 0; n < visible; n++) {
+        if (this.pDepth[this.sortOrder[n]] <= 0.95) continue;
+        if ((this.sortKeys[n] & 1) === 1) continue;
+        const colorKey = quantizeColor(this.frameR[n], this.frameG[n], this.frameB[n]);
+        ctx.fillStyle = styleFor(colorKey, (this.frameAlpha[n] * 0.28) | 0);
         const size =
-          Math.min(3.4, p.size) *
+          Math.min(3.4, this.pSize[this.sortOrder[n]]) *
           particleSizeMult *
-          (0.75 + p.depth * 0.35) *
-          (1 - local * 0.4);
-        ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
-        ctx.fillRect(x, y, size, size);
+          (0.75 + this.pDepth[this.sortOrder[n]] * 0.35) *
+          (1 - this.frameLocal[n] * 0.4) *
+          0.8;
+        ctx.fillRect(this.frameX[n], this.frameY[n], size, size);
+      }
+    }
+  }
 
-        if (!lowPower && p.depth > 0.95) {
-          ctx.fillStyle = `rgba(${r},${g},${b},${alpha * 0.28})`;
-          ctx.fillRect(
-            x - dx * 0.05,
-            y - dy * 0.05,
-            size * 0.8,
-            size * 0.8,
-          );
+  // Per-frame emission scratch (grow-once, never reallocated in steady state).
+  private frameX = new Float32Array(DustScene.MAX_PARTICLES);
+  private frameY = new Float32Array(DustScene.MAX_PARTICLES);
+  private frameAlpha = new Uint8Array(DustScene.MAX_PARTICLES);
+  private frameR = new Uint8Array(DustScene.MAX_PARTICLES);
+  private frameG = new Uint8Array(DustScene.MAX_PARTICLES);
+  private frameB = new Uint8Array(DustScene.MAX_PARTICLES);
+  private frameLocal = new Float32Array(DustScene.MAX_PARTICLES);
+
+  private emitBucketed(
+    ctx: CanvasRenderingContext2D,
+    visible: number,
+    particleSizeMult: number,
+    shardsAllowed: boolean,
+  ) {
+    const counts = this.bucketCounts;
+    const cursor = this.bucketCursor;
+    counts.fill(0);
+
+    const keys = this.sortKeys;
+    const order = this.sortOrder;
+    for (let n = 0; n < visible; n++) {
+      const bucket = keys[n] >> 1;
+      counts[bucket + 1] += 1;
+    }
+    for (let k = 1; k <= BUCKET_COUNT; k++) counts[k] += counts[k - 1];
+    cursor.set(counts);
+
+    for (let n = 0; n < visible; n++) {
+      const bucket = keys[n] >> 1;
+      order[cursor[bucket]++] = n;
+    }
+
+    let currentBucket = -1;
+    let style = "";
+    for (let b = 0; b < BUCKET_COUNT; b++) {
+      const start = counts[b];
+      const end = counts[b + 1];
+      if (start === end) continue;
+      for (let k = start; k < end; k++) {
+        const n = order[k];
+        const isShard = (keys[n] & 1) === 1;
+        if (isShard && !shardsAllowed) continue;
+        if (currentBucket !== b) {
+          currentBucket = b;
+          style = styleFor((b / ALPHA_STEPS) | 0, this.frameAlpha[n]);
+          ctx.fillStyle = style;
+        }
+        if (isShard) {
+          this.emitShard(ctx, n, particleSizeMult);
+        } else {
+          this.emitGrain(ctx, n, particleSizeMult);
         }
       }
     }
+  }
+
+  private emitDirect(
+    ctx: CanvasRenderingContext2D,
+    visible: number,
+    particleSizeMult: number,
+    shardsAllowed: boolean,
+  ) {
+    for (let n = 0; n < visible; n++) {
+      const key = this.sortKeys[n] >> 1;
+      const isShard = (this.sortKeys[n] & 1) === 1;
+      if (isShard && !shardsAllowed) continue;
+      ctx.fillStyle = styleFor((key / ALPHA_STEPS) | 0, this.frameAlpha[n]);
+      if (isShard) this.emitShard(ctx, n, particleSizeMult);
+      else this.emitGrain(ctx, n, particleSizeMult);
+    }
+  }
+
+  private emitGrain(
+    ctx: CanvasRenderingContext2D,
+    n: number,
+    particleSizeMult: number,
+  ) {
+    const i = this.sortOrder[n];
+    const depth = this.pDepth[i];
+    const local = this.frameLocal[n];
+    const size =
+      Math.min(3.4, this.pSize[i]) *
+      particleSizeMult *
+      (0.75 + depth * 0.35) *
+      (1 - local * 0.4);
+    ctx.fillRect(this.frameX[n], this.frameY[n], size, size);
+  }
+
+  private emitShard(
+    ctx: CanvasRenderingContext2D,
+    n: number,
+    particleSizeMult: number,
+  ) {
+    const i = this.sortOrder[n];
+    const local = this.frameLocal[n];
+    const depthScale = 0.65 + this.pDepth[i] * 0.55;
+    const shardSize =
+      this.pSize[i] *
+      particleSizeMult *
+      depthScale *
+      (this.pSeed[i] > 0.88 ? 1.25 : 0.95) *
+      (1 - local * 0.48);
+    const theta = this.pAngle[i] + local * this.pSpin[i];
+    const c = Math.cos(theta) * shardSize;
+    const s = Math.sin(theta) * shardSize;
+    const x = this.frameX[n];
+    const y = this.frameY[n];
+    ctx.beginPath();
+    ctx.moveTo(x + c, y + s);
+    ctx.lineTo(x - s * 0.72, y + c * 0.72);
+    ctx.lineTo(x - c * 0.85, y - s * 0.85);
+    ctx.lineTo(x + s * 0.55, y - c * 0.55);
+    ctx.closePath();
+    ctx.fill();
   }
 
   private renderPixelDissolve(
@@ -826,34 +1099,44 @@ export class DustScene {
     this.lastActiveParticles = Math.floor(total / blockStride);
     const spread = 480 * speed * (duration / 1.8) * (0.6 + intensity * 0.5);
     const baseTileSize = Math.max(5, Math.round(9 * particleSizeMult));
+    const toward = dir === "toward";
+    const motionLut = motionLutFor(smoothness);
+    let lastKey = -1;
 
     for (let i = 0; i < total; i += blockStride) {
-      const p = this.particlePool[i];
-      if (tt <= p.delay) continue;
-      const local = Math.min(1, (tt - p.delay) / (1 - p.delay + 0.0001));
-      const snapGridX = Math.round(p.x / baseTileSize) * baseTileSize;
-      const snapGridY = Math.round(p.y / baseTileSize) * baseTileSize;
+      const delay = this.pDelay[i];
+      if (tt <= delay) continue;
+      const local = tt >= 1 ? 1 : (tt - delay) / (1 - delay + 0.0001);
+      const snapGridX =
+        Math.round(this.pX[i] / baseTileSize) * baseTileSize;
+      const snapGridY =
+        Math.round(this.pY[i] / baseTileSize) * baseTileSize;
 
-      const stepE = evaluateMotionCurve(local, smoothness);
+      const stepE = motionLut[(local * LUT_MASK) | 0];
+      const power = this.pPower[i];
       const dx =
-        (dir === "toward" ? (p.x - this.w / 2) * 0.9 : wind.x * spread) *
-        stepE *
-        p.power;
+        (toward ? (this.pX[i] - this.w / 2) * 0.9 : wind.x * spread) * stepE * power;
       const dy =
-        (dir === "toward" ? (p.y - this.h / 2) * 0.9 : wind.y * spread - 90) *
+        (toward ? (this.pY[i] - this.h / 2) * 0.9 : wind.y * spread - 90) *
         stepE *
-        p.power;
+        power;
 
-      const alpha = Math.max(0, 1 - local * 1.08);
+      const alpha = 1 - local * 1.08;
       if (alpha <= 0.02) continue;
 
       const edgeGlow = local < 0.35 ? (1 - local / 0.35) * intensity : 0;
-      const r = Math.round(p.r * (1 - edgeGlow) + accent.r * edgeGlow);
-      const g = Math.round(p.g * (1 - edgeGlow) + accent.g * edgeGlow);
-      const b = Math.round(p.b * (1 - edgeGlow) + accent.b * edgeGlow);
+      const r = (this.pR[i] * (1 - edgeGlow) + accent.r * edgeGlow) | 0;
+      const g = (this.pG[i] * (1 - edgeGlow) + accent.g * edgeGlow) | 0;
+      const b = (this.pB[i] * (1 - edgeGlow) + accent.b * edgeGlow) | 0;
 
       const tileSize = Math.max(2, baseTileSize * (1 - local * 0.45));
-      ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+      const colorKey = quantizeColor(r, g, b);
+      const alphaByte = alpha >= 1 ? 255 : (alpha * 255) | 0;
+      const key = colorKey * ALPHA_STEPS + (alphaByte >> ALPHA_SHIFT);
+      if (key !== lastKey) {
+        lastKey = key;
+        ctx.fillStyle = styleFor(colorKey, alphaByte);
+      }
       ctx.fillRect(snapGridX + dx, snapGridY + dy, tileSize, tileSize);
     }
   }
@@ -872,6 +1155,7 @@ export class DustScene {
     const sliceH = Math.ceil(h / slices);
     const wind = windFor(dir);
     const maxShift = (140 + intensity * 180) * (wind.x !== 0 ? wind.x : 1);
+    const accentStyle = `rgba(${accent.r},${accent.g},${accent.b},`;
 
     for (let s = 0; s < slices; s++) {
       const sy = s * sliceH;
@@ -885,9 +1169,8 @@ export class DustScene {
 
       const jitter =
         pseudoRand * maxShift * Math.pow(sliceProgress, 1.3) * intensity;
-      const alpha = Math.max(0, 1 - Math.pow(sliceProgress, 1.5));
+      const alpha = 1 - Math.pow(sliceProgress, 1.5);
 
-      ctx.save();
       ctx.globalAlpha = alpha;
       ctx.drawImage(this.person, 0, sy, w, sliceH, jitter, sy, w, sliceH);
 
@@ -896,7 +1179,7 @@ export class DustScene {
         sliceProgress < 0.85 &&
         Math.abs(pseudoRand) > 0.35
       ) {
-        ctx.fillStyle = `rgba(${accent.r},${accent.g},${accent.b},${0.28 * alpha * intensity})`;
+        ctx.fillStyle = `${accentStyle}${(0.28 * alpha * intensity).toFixed(2)})`;
         ctx.fillRect(
           w * 0.25 + jitter * 1.3,
           sy,
@@ -904,8 +1187,8 @@ export class DustScene {
           Math.max(2, sliceH * 0.35),
         );
       }
-      ctx.restore();
     }
+    ctx.globalAlpha = 1;
   }
 
   private renderFadeOut(
@@ -918,16 +1201,14 @@ export class DustScene {
     const { w, h } = this;
     this.lastActiveParticles = 0;
     const eased = evaluateMotionCurve(tt, smoothness);
-    const alpha = Math.max(0, 1 - eased);
+    const alpha = 1 - eased;
 
-    ctx.save();
     ctx.globalAlpha = alpha;
     ctx.drawImage(this.person, 0, 0);
-    ctx.restore();
+    ctx.globalAlpha = 1;
 
     const midPulse = Math.sin(tt * Math.PI) * 0.16 * intensity;
     if (midPulse > 0.01) {
-      ctx.save();
       const grad = ctx.createRadialGradient(
         w * 0.5,
         h * 0.45,
@@ -938,12 +1219,11 @@ export class DustScene {
       );
       grad.addColorStop(
         0,
-        `rgba(${accent.r},${accent.g},${accent.b},${midPulse})`,
+        `rgba(${accent.r},${accent.g},${accent.b},${midPulse.toFixed(3)})`,
       );
       grad.addColorStop(1, "rgba(0,0,0,0)");
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, w, h);
-      ctx.restore();
     }
   }
 
@@ -969,10 +1249,10 @@ export class DustScene {
       const cy = h * 0.42;
       const radius = w * (0.18 + tt * 0.55);
       const g = ctx.createRadialGradient(cx, cy, 4, cx, cy, radius);
-      g.addColorStop(0, `rgba(255,250,240,${Math.min(0.85, flash * 0.88)})`);
+      g.addColorStop(0, `rgba(255,250,240,${Math.min(0.85, flash * 0.88).toFixed(3)})`);
       g.addColorStop(
         0.35,
-        `rgba(${accent.r},${accent.g},${accent.b},${flash * 0.52})`,
+        `rgba(${accent.r},${accent.g},${accent.b},${(flash * 0.52).toFixed(3)})`,
       );
       g.addColorStop(1, "rgba(0,0,0,0)");
       ctx.fillStyle = g;
@@ -987,30 +1267,40 @@ export class DustScene {
     this.lastActiveParticles = Math.floor(total / stride);
     const wind = windFor(dir);
     const spread = 540 * speed * (duration / 1.8);
+    const motionLut = motionLutFor(smoothness);
+    let lastAlphaQ = -1;
 
     for (let i = 0; i < total; i += stride) {
-      const p = this.particlePool[i];
-      if (tt <= p.delay) continue;
-      const local = Math.min(1, (tt - p.delay) / (1 - p.delay + 0.0001));
-      const eased = evaluateMotionCurve(local, smoothness);
-      const rx = p.x - w * 0.54;
-      const ry = p.y - h * 0.45;
-      const radialDist = Math.hypot(rx, ry) || 1;
+      const delay = this.pDelay[i];
+      if (tt <= delay) continue;
+      const local = tt >= 1 ? 1 : (tt - delay) / (1 - delay + 0.0001);
+      const eased = motionLut[(local * LUT_MASK) | 0];
+      const rx = this.pX[i] - w * 0.54;
+      const ry = this.pY[i] - h * 0.45;
+      const radialDist = Math.sqrt(rx * rx + ry * ry) || 1;
       const ux = rx / radialDist + wind.x * 0.45;
       const uy = ry / radialDist + wind.y * 0.45;
 
-      const x = p.x + ux * eased * spread * p.power;
-      const y = p.y + uy * eased * spread * p.power;
-      const alpha = Math.sin(local * Math.PI) * intensity * (0.6 + p.depth * 0.3);
+      const x = this.pX[i] + ux * eased * spread * this.pPower[i];
+      const y = this.pY[i] + uy * eased * spread * this.pPower[i];
+      const alpha =
+        Math.sin(local * Math.PI) * intensity * (0.6 + this.pDepth[i] * 0.3);
       if (alpha <= 0.02) continue;
 
       const radius =
-        (2.0 + Math.min(3.5, p.size) * 1.6) *
+        (2.0 + Math.min(3.5, this.pSize[i]) * 1.6) *
         particleSizeMult *
         (1 - local * 0.32);
-      ctx.fillStyle = `rgba(${Math.min(255, accent.r + 50)},${Math.min(255, accent.g + 50)},${Math.min(255, accent.b + 50)},${alpha})`;
+      const aq = (alpha * 255) >> 3;
+      if (aq !== lastAlphaQ) {
+        lastAlphaQ = aq;
+        ctx.fillStyle = `rgba(${Math.min(255, accent.r + 50)},${Math.min(
+          255,
+          accent.g + 50,
+        )},${Math.min(255, accent.b + 50)},${(aq / 31).toFixed(2)})`;
+      }
       ctx.beginPath();
-      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.arc(x, y, radius, 0, TAU);
       ctx.fill();
     }
   }
@@ -1036,7 +1326,7 @@ export class DustScene {
     this.paintFallbackRoom(ctx);
     ctx.fillStyle = "#292524";
     ctx.beginPath();
-    ctx.ellipse(w * 0.5, h * 0.3, w * 0.098, h * 0.142, 0, 0, Math.PI * 2);
+    ctx.ellipse(w * 0.5, h * 0.3, w * 0.098, h * 0.142, 0, 0, TAU);
     ctx.fill();
     ctx.beginPath();
     ctx.moveTo(w * 0.3, h * 1.05);
@@ -1047,6 +1337,10 @@ export class DustScene {
     ctx.fillStyle = "#44403c";
     ctx.fillRect(w * 0.4, h * 0.52, w * 0.2, h * 0.53);
   }
+}
+
+function useShardVariant(variant: "classic" | "cinematic" | "fine", lowPower: boolean) {
+  return variant !== "fine" && !lowPower;
 }
 
 /** A single synthesised snap click — band-passed noise burst. */

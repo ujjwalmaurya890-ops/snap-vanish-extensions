@@ -63,20 +63,77 @@ function localVisionAssetsPlugin(): Plugin {
   };
 }
 
-export default defineConfig({
-  base: "./",
-  plugins: [react(), tailwindcss(), localVisionAssetsPlugin()],
-  server: {
-    host: "0.0.0.0",
-    allowedHosts: true,
-  },
-  preview: {
-    host: "0.0.0.0",
-    allowedHosts: true,
-  },
-  resolve: {
-    alias: {
-      "@": path.resolve(__dirname, "src"),
+export default defineConfig(({ command }) => {
+  const isProd = command === "build";
+
+  return {
+    base: "./",
+    plugins: [react(), tailwindcss(), localVisionAssetsPlugin()],
+
+    server: {
+      host: "0.0.0.0",
+      allowedHosts: true,
     },
-  },
+    preview: {
+      host: "0.0.0.0",
+      allowedHosts: true,
+    },
+
+    resolve: {
+      alias: [
+        { find: "@/", replacement: path.resolve(__dirname, "src") },
+        /**
+         * Both surfaces (the React studio and the content script) must ship the
+         * *same* MediaPipe build. The content script can only load the local
+         * `extension/vendor/vision_bundle.mjs` at runtime, so aliasing the npm
+         * package to that file removes a second ~420 kB copy from the studio
+         * bundle and guarantees identical inference behaviour.
+         */
+        {
+          find: /^@mediapipe\/tasks-vision$/,
+          replacement: path.resolve(__dirname, "extension/vendor/vision_bundle.mjs"),
+        },
+      ],
+    },
+
+    build: {
+      // Matches `minimum_chrome_version: 121` in the manifest — no downlevelling
+      // of syntax the runtime already supports.
+      target: "chrome121",
+      outDir: "dist",
+      emptyOutDir: true,
+      sourcemap: false,
+      // Skipping gzip sizing shaves several seconds off every build.
+      reportCompressedSize: false,
+      // Extension assets are local files; sub-4 kB inlining just adds base64 noise.
+      assetsInlineLimit: 4096,
+      chunkSizeWarningLimit: 900,
+      cssCodeSplit: false,
+      minify: "esbuild",
+      rollupOptions: {
+        output: {
+          entryFileNames: "assets/[name]-[hash].js",
+          chunkFileNames: "assets/[name]-[hash].js",
+          assetFileNames: "assets/[name]-[hash][extname]",
+          // Keep React/MediaPipe in dedicated chunks so a settings-only code change
+          // does not invalidate the 400 kB vendor chunk in the packaged extension.
+          manualChunks: {
+            react: ["react", "react-dom"],
+          },
+        },
+      },
+    },
+
+    esbuild: isProd
+      ? {
+          legalComments: "none",
+          drop: ["debugger"],
+          pure: ["console.debug", "console.trace"],
+        }
+      : undefined,
+
+    define: {
+      __SNAP_VANISH_PROD__: JSON.stringify(isProd),
+    },
+  };
 });
