@@ -2,12 +2,13 @@ import type {
   AnalyticsEvent,
   AnalyticsEventType,
   EffectType,
+  EngineState,
   MeetingModeId,
   UsageAnalyticsSummary,
 } from "../types/snapVanish";
 import { STORAGE_KEYS, broadcastSyncEvent } from "./settings";
 
-const MAX_STORED_EVENTS = 200;
+const MAX_STORED_EVENTS = 250;
 
 export function createEmptyAnalytics(): UsageAnalyticsSummary {
   return {
@@ -18,6 +19,8 @@ export function createEmptyAnalytics(): UsageAnalyticsSummary {
     cooldownBlocks: 0,
     effectCounts: {
       dust: 0,
+      "cinematic-disintegration": 0,
+      "fine-particles": 0,
       "pixel-dissolve": 0,
       "digital-glitch": 0,
       "fade-out": 0,
@@ -75,13 +78,27 @@ export function loadAnalytics(): UsageAnalyticsSummary {
   }
 }
 
-export function saveAnalytics(summary: UsageAnalyticsSummary): UsageAnalyticsSummary {
+export function saveAnalytics(
+  summary: UsageAnalyticsSummary,
+): UsageAnalyticsSummary {
   try {
     if (typeof localStorage !== "undefined") {
       localStorage.setItem(STORAGE_KEYS.ANALYTICS, JSON.stringify(summary));
     }
   } catch {
     // Ignore storage quota error
+  }
+  const g = globalThis as unknown as {
+    chrome?: {
+      storage?: {
+        local?: { set: (items: Record<string, unknown>) => Promise<void> };
+      };
+    };
+  };
+  if (g.chrome?.storage?.local) {
+    void g.chrome.storage.local
+      .set({ [STORAGE_KEYS.ANALYTICS]: summary })
+      .catch(() => {});
   }
   broadcastSyncEvent("ANALYTICS_UPDATED", summary);
   return summary;
@@ -92,10 +109,16 @@ export function recordAnalyticsEvent(params: {
   effect?: EffectType;
   presetId?: string;
   modeId?: MeetingModeId;
-  source?: "manual" | "gesture" | "shortcut" | "popup" | "dashboard";
+  source?: "manual" | "gesture" | "shortcut" | "popup" | "dashboard" | "system";
+  sessionStatus?: EngineState;
   reason?: string;
   timestamp?: string;
+  enabled?: boolean;
 }): UsageAnalyticsSummary {
+  if (params.enabled === false) {
+    return loadAnalytics();
+  }
+
   const summary = loadAnalytics();
   const nowIso = params.timestamp ?? new Date().toISOString();
   const dayKey = nowIso.slice(0, 10);
@@ -108,6 +131,7 @@ export function recordAnalyticsEvent(params: {
     presetId: params.presetId,
     modeId: params.modeId,
     source: params.source,
+    sessionStatus: params.sessionStatus,
     reason: params.reason,
   };
 
@@ -129,6 +153,7 @@ export function recordAnalyticsEvent(params: {
       summary.successfulRestorations += 1;
       break;
     case "trigger_failed":
+    case "error_recorded":
       summary.failedTriggers += 1;
       break;
     case "trigger_blocked_cooldown":
@@ -158,6 +183,16 @@ export function clearAnalyticsData(): UsageAnalyticsSummary {
   } catch {
     // Ignore
   }
+  const g = globalThis as unknown as {
+    chrome?: {
+      storage?: {
+        local?: { remove?: (keys: string | string[]) => Promise<void> };
+      };
+    };
+  };
+  if (g.chrome?.storage?.local?.remove) {
+    void g.chrome.storage.local.remove(STORAGE_KEYS.ANALYTICS).catch(() => {});
+  }
   broadcastSyncEvent("ANALYTICS_UPDATED", empty);
   return empty;
 }
@@ -174,7 +209,11 @@ export interface WeeklyUsageDay {
 export function getWeeklyUsageSummary(
   summary: UsageAnalyticsSummary,
   referenceDate = new Date(),
-): { days: WeeklyUsageDay[]; totalWeekActivations: number; mostUsedEffect: EffectType | null } {
+): {
+  days: WeeklyUsageDay[];
+  totalWeekActivations: number;
+  mostUsedEffect: EffectType | null;
+} {
   const days: WeeklyUsageDay[] = [];
   let totalWeekActivations = 0;
 

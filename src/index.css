@@ -1,32 +1,44 @@
 @import "tailwindcss";
 
 @theme {
-  --color-paper: #f2ede3;
-  --color-paper-2: #e7dfd1;
-  --color-paper-3: #ddd3c2;
-  --color-rule: #d6cbb8;
-  --color-ink: #191510;
-  --color-ink-2: #4a4238;
-  --color-ink-soft: #6f6555;
-  --color-ember: #d2451e;
-  --color-ember-hi: #f0623a;
-  --color-ember-deep: #8e2a11;
-  --color-frame: #0d0c0a;
-  --color-frame-2: #17140f;
+  /* Snap Vanish 2.0 Design Tokens — Deep Charcoal & Warm Ember */
+  --color-obsidian: #09090b;
+  --color-charcoal: #111216;
+  --color-surface: #16181e;
+  --color-surface-2: #1e2028;
+  --color-surface-3: #272a35;
 
-  --font-display: "Instrument Serif", "Times New Roman", serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
-  --font-sans: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  --color-ink: #f4f4f6;
+  --color-ink-2: #a1a6b5;
+  --color-ink-soft: #6c7284;
+
+  --color-ember: #e0532c;
+  --color-ember-hi: #f0623a;
+  --color-ember-glow: #ff8a65;
+  --color-ember-deep: #7c2712;
+
+  --color-rule: rgba(255, 255, 255, 0.08);
+  --color-frame: #09090b;
+  --color-frame-2: #111216;
+  --color-paper: #09090b;
+  --color-paper-2: #111216;
+  --color-paper-3: #16181e;
+
+  --font-display: "Instrument Serif", Georgia, "Times New Roman", serif;
+  --font-mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, system-ui, sans-serif;
 }
 
 @layer base {
   html {
     -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
     scroll-behavior: smooth;
+    color-scheme: dark;
   }
 
   body {
-    background-color: var(--color-paper);
+    background-color: var(--color-obsidian);
     color: var(--color-ink);
     font-family: var(--font-sans);
     font-feature-settings: "tnum" 1;
@@ -35,20 +47,20 @@
 
   ::selection {
     background: var(--color-ember);
-    color: var(--color-paper);
+    color: #ffffff;
   }
 
   :focus-visible {
-    outline: 2px solid var(--color-ember);
-    outline-offset: 3px;
+    outline: 2px solid var(--color-ember-hi);
+    outline-offset: 2px;
   }
 }
 
 @utility rail {
   font-family: var(--font-mono);
   font-size: 10.5px;
-  line-height: 1.55;
-  letter-spacing: 0.18em;
+  line-height: 1.5;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
   font-weight: 500;
 }
@@ -56,7 +68,7 @@
 @utility label {
   font-family: var(--font-mono);
   font-size: 11px;
-  letter-spacing: 0.16em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
   font-weight: 500;
 }
@@ -65,45 +77,32 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Photographic print: hard shadow + hairline edge */
-@utility tipped {
-  box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.5),
-    14px 18px 0 rgba(25, 21, 16, 0.1),
-    0 26px 50px -18px rgba(25, 21, 16, 0.45);
+@utility glass-card {
+  background: linear-gradient(180deg, rgba(24, 26, 33, 0.88) 0%, rgba(17, 18, 22, 0.94) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 18px 40px -20px rgba(0, 0, 0, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  backdrop-filter: blur(12px);
 }
 
-.grain {
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 60;
-  opacity: 0.42;
-  mix-blend-mode: multiply;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23n)' opacity='0.36'/%3E%3C/svg%3E");
-}
-
-.hairline {
-  background-image: repeating-linear-gradient(
-    to right,
-    var(--color-rule) 0 1px,
-    transparent 1px 6px
-  );
-}
-
+/* Custom precision range input */
 input[type="range"] {
   -webkit-appearance: none;
   appearance: none;
   width: 100%;
-  height: 22px;
+  height: 20px;
   background: transparent;
   cursor: pointer;
 }
 
+input[type="range"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 input[type="range"]::-webkit-slider-runnable-track {
-  height: 3px;
-  background: var(--color-rule);
-  border-radius: 0;
+  height: 4px;
+  background: #272a35;
+  border-radius: 999px;
 }
 
 input[type="range"]::-webkit-slider-thumb {
@@ -111,24 +110,31 @@ input[type="range"]::-webkit-slider-thumb {
   appearance: none;
   width: 15px;
   height: 15px;
-  margin-top: -6px;
+  margin-top: -5.5px;
   border-radius: 50%;
-  background: var(--color-ember);
-  border: 2px solid var(--color-paper);
-  box-shadow: 0 1px 4px rgba(25, 21, 16, 0.35);
+  background: var(--color-ember-hi);
+  border: 2px solid #ffffff;
+  box-shadow: 0 2px 8px rgba(224, 83, 44, 0.45);
+  transition: transform 0.12s ease, background-color 0.12s ease;
+}
+
+input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb {
+  transform: scale(1.1);
+  background: #ff7750;
 }
 
 input[type="range"]::-moz-range-track {
-  height: 3px;
-  background: var(--color-rule);
+  height: 4px;
+  background: #272a35;
+  border-radius: 999px;
 }
 
 input[type="range"]::-moz-range-thumb {
   width: 15px;
   height: 15px;
-  border: 2px solid var(--color-paper);
+  border: 2px solid #ffffff;
   border-radius: 50%;
-  background: var(--color-ember);
+  background: var(--color-ember-hi);
 }
 
 @media (prefers-reduced-motion: reduce) {

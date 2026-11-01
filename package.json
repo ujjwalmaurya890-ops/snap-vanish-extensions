@@ -1,18 +1,23 @@
 {
-  "name": "react-vite-tailwind",
+  "name": "snap-vanish-extension",
   "private": true,
-  "version": "0.0.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prepare:assets": "node scripts/prepare-assets.mjs",
     "build": "vite build",
-    "preview": "vite preview",
+    "build:extension": "node scripts/build-extension.mjs",
+    "preview": "vite preview --host 0.0.0.0",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "^1.2.0",
     "clsx": "2.1.1",
     "framer-motion": "^14.6.0",
+    "lucide-react": "^1.66.0",
     "react": "19.2.6",
     "react-dom": "19.2.6",
     "tailwind-merge": "3.4.0"

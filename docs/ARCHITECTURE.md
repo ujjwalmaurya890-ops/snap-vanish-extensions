@@ -1,55 +1,33 @@
-# Snap Vanish v2.0.0 — System Architecture
+# Snap Vanish 2.0 — Technical Architecture
 
-## 1. High-Level Overview
+## 1. Dual-Surface Architecture
 
-Snap Vanish is organized into two synchronized runtime surfaces built from a shared repository:
+Snap Vanish 2.0 operates seamlessly across two synchronized surfaces sharing a single TypeScript core:
 
-1. **Chrome Manifest V3 Extension (`extension/`)**:
-   - `extension/manifest.json`: Declares least-privilege permissions (`activeTab`, `storage`) and host permissions (`meet.google.com`, `teams.microsoft.com`, `*.zoom.us`).
-   - `extension/background.js`: Service worker that initializes default settings in `chrome.storage.sync`, validates incoming runtime messages, and dispatches keyboard shortcuts (`Alt+Shift+S`, `Alt+Shift+D`, `Alt+Shift+M`, `Alt+Shift+R`) to the active call tab.
-   - `extension/content/snap-vanish.js` & `extension/content/snap-vanish.css`: Content script that manages the call-tab state machine (`live`, `vanishing`, `vanished`, `restoring`, `error`), hand-landmark + acoustic snap confirmation, reversible canvas overlay rendering, emergency restore HUD, and resource cleanup.
-   - `extension/popup/popup.html`, `popup.css`, `popup.js`: 360px dark-theme popup controller for real-time call control, effect selection, Smart Meeting Mode switching, and recovery.
-
-2. **Companion SaaS Web Application & Studio (`src/`)**:
-   - Built with React 19, TypeScript 5.9, Tailwind CSS v4, and Vite 7.
-   - Hosts the interactive 1280×720 60fps calibration stage (`SnapStage.tsx`), synchronized popup preview (`VanishPopup.tsx`), First-Run Onboarding Wizard (`OnboardingModal.tsx`), and full 8-module SaaS Control Center (`Dashboard.tsx`).
-
----
-
-## 2. Separation of Concerns (`src/`)
-
-| Layer | File Path | Responsibility |
-| :--- | :--- | :--- |
-| **Shared Types** | `src/types/snapVanish.ts` | Canonical TypeScript interfaces for `SnapSettings`, `EffectPreset`, `EngineState`, `InterceptionMode`, `ExtensionMessage`, `UsageAnalyticsSummary`, `DiagnosticSnapshot`, `EntitlementState`, and `FeedbackSubmission`. |
-| **Settings & Presets** | `src/lib/settings.ts` | Schema validation (`validateSettings`, `mergeAndValidateSettings`), Smart Meeting Mode definitions (`MEETING_MODES`), built-in and custom preset CRUD, and dual persistence (`localStorage` + `chrome.storage.sync` + `BroadcastChannel`). |
-| **Messaging Bridge** | `src/lib/messaging.ts` | Runtime message schema validator (`validateExtensionMessage`) and resilient `chrome.runtime.sendMessage` wrapper (`sendExtensionMessage`) with automatic retry on service-worker wake-up. |
-| **Core Vanish Engine** | `src/lib/vanishEngine.ts` | Deterministic state machine (`live` -> `vanishing` -> `vanished` -> `restoring` -> `live` + `error`), repeated-trigger debounce/cooldown protection, idempotent initialization, `MediaStreamTrack` `ended` recovery, `emergencyRestore()`, and `dispose()`. |
-| **Multi-Effect Renderer** | `src/lib/dust.ts` | Analytic, reversible (`t: 0 <-> 1`) 2D Canvas effect engine supporting `dust`, `pixel-dissolve`, `digital-glitch`, `fade-out`, and `light-burst`, with Low-Power density capping and automatic cross-dissolve fallback on error. |
-| **Gesture & Audio Engine** | `src/lib/gestureEngine.ts` | 21-point hand landmark trajectory evaluator (`SnapGestureDetector`) with wrist angular velocity and bounding-box stability checks, plus short-transient acoustic confirmer (`AcousticSnapConfirmer`). |
-| **Local Analytics** | `src/lib/analytics.ts` | Privacy-preserving local event counters, 7-day rolling usage aggregation (`getWeeklyUsageSummary`), and instant data wipe (`clearAnalyticsData`). |
-| **Diagnostics & Telemetry** | `src/lib/diagnostics.ts` | Real frame-interval FPS and per-frame render latency tracker (`FramePerformanceTracker`), WebGL2/MediaDevices capability probing, and local diagnostic log rotation. |
-| **Cloud Sync & Billing** | `src/lib/cloudAndBilling.ts` | Optional Supabase GoTrue/PostgREST client, deterministic `updatedAt` preset conflict resolver (`resolvePresetSyncConflicts`), and honest `BLOCKED` reporting when credentials are unconfigured. |
-| **Feedback & Changelog** | `src/lib/feedbackAndChangelog.ts` | Local bug/feature report store with explicit opt-in consent before attaching diagnostic snapshots, plus structured release notes. |
+1. **Control Center & Personalization Studio (`src/` → `dist/` & `extension/studio/`)**
+   - Full-featured React 19 + TypeScript application bundled with external CSP-safe assets (`base: "./"`).
+   - Serves both as the standalone web Effect Studio (`npm run dev`) and as the Chrome Extension `options_page` (`extension/studio/index.html`).
+2. **Manifest V3 Conferencing Runtime (`extension/`)**
+   - **`extension/content/main-world-bridge.js` (`MAIN` world, `document_start`)**: Wraps `window.RTCPeerConnection` prior to call initialization, tracking active video `RTCRtpSender`s and their original hardware `MediaStreamTrack`s. Handles `ATTACH_PROCESSED_STREAM` (`sender.replaceTrack(canvasTrack)`) and `RESTORE_ORIGINAL_TRACK` (`sender.replaceTrack(originalHardwareTrack)`).
+   - **`extension/content/snap-vanish.js` (`ISOLATED` world, `document_idle`)**: Loads bundled MediaPipe HandLandmarker WASM inside the isolated extension world, evaluates 21-point hand kinematics + optional Web Audio transient confirmation, renders pooled dust/fragment particles onto `#snap-vanish-rtc-canvas` and `#snap-vanish-overlay-canvas`, and manages the non-intrusive `#snap-vanish-hud`.
+   - **`extension/background.js`**: Stateless MV3 service worker validating messages, routing Chrome `commands` (`Alt+Shift+S`, `Alt+Shift+D`, `Alt+Shift+M`, `Alt+Shift+R`), and updating toolbar badge state.
+   - **`extension/popup/*`**: Lightweight zero-framework popup synchronized via `chrome.storage.sync`, `chrome.storage.local`, and runtime messaging.
 
 ---
 
-## 3. Video Pipeline & WebRTC Interception Architecture
+## 2. MediaPipe MV3 `ISOLATED`-World WASM Loader
 
-A critical architectural distinction in browser extensions is how camera effects are displayed:
+In `@mediapipe/tasks-vision`, the default `FilesetResolver.forVisionTasks()` helper injects a `<script src="...">` element into `document.body`. Inside a Chrome MV3 content script:
+1. `<script>` tags injected into `document.body` execute in the host page's `MAIN` world (frequently blocked by Google Meet / Teams Trusted Types & CSP), and
+2. `self.ModuleFactory` remains `undefined` inside the content script's `ISOLATED` world.
 
-1. **`preview-only` (Companion Web Dashboard / Studio)**:
-   - Renders effects over the local calibration room and person plates on a 1280×720 `<canvas>` element while measuring real frame latency and FPS.
-2. **`dom-overlay` (Default Content Script Mode on Meet / Teams / Zoom)**:
-   - Content scripts declared in `manifest.json` execute in Chrome's `ISOLATED` JavaScript world.
-   - When triggered on a call tab, `VanishController` captures the current video frame, constructs the particle/effect scene over the background plate, mounts `.snap-vanish-overlay-canvas` over the call video container, and synchronizes microphone mute state.
-3. **`webrtc-sender` (Direct `RTCRtpSender.replaceTrack` Mode)**:
-   - Replacing outgoing WebRTC tracks sent to remote peers requires page-level `RTCPeerConnection` references (`window.__snapVanishPeerConnections`).
-   - Rather than claiming `replaceTrack()` succeeded when no `RTCPeerConnection` sender was intercepted, `VanishController` explicitly reports `interceptionMode` as `"webrtc-sender"` only when active peer connections are present, `"dom-overlay"` when overlaying the page's `<video>` element, or `"inactive"` when no video element is active.
+Snap Vanish solves this cleanly in both `src/features/detection/handTracker.ts` and `extension/content/snap-vanish.js` by:
+1. Dynamically importing `wasm/vision_wasm_module_internal.js` via `await import(...)` inside the current JS realm, binding `globalThis.ModuleFactory = mod.default`.
+2. Passing `{ wasmLoaderPath: "", wasmBinaryPath: wasmBinaryUrl }` to `HandLandmarker.createFromOptions()`, skipping `<script>` DOM injection completely while loading `models/hand_landmarker.task` from local extension storage with automatic GPU → CPU delegate fallback.
 
 ---
 
-## 4. Security & Privacy Architecture
+## 3. Storage Partitioning & Schema Migration
 
-- **Zero Default Egress:** No camera frames, background plates, or microphone audio buffers are ever serialized or transmitted over the network.
-- **Least-Privilege Manifest V3:** Only `activeTab` and `storage` permissions are requested; the unused `offscreen` permission from the v1.4.0 baseline has been removed.
-- **No Hardcoded Secrets:** Cloud sync and billing URLs are read strictly from `VITE_*` environment variables and remain disabled (`BLOCKED`) until configured by the operator.
+- **`chrome.storage.sync`**: Stores validated `SnapSettings` (`schemaVersion: 2`, compact preferences well under Chrome's 8 KB item quota). Legacy v1 payloads are automatically upgraded by `migrateSettingsPayload()`.
+- **`chrome.storage.local`**: Stores custom `EffectPreset[]`, metadata-only `UsageAnalyticsSummary`, and the bounded 120-entry `DiagnosticLogEntry[]` ring buffer so logs never consume sync quota or leave the local machine.

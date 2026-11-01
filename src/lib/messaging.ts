@@ -10,8 +10,12 @@ export const VALID_MESSAGE_TYPES: readonly ExtensionMessageType[] = [
   "SNAP_NOW",
   "SNAP_TOGGLE",
   "SNAP_VANISH_NOW",
+  "SNAP_RESTORE_NOW",
   "EMERGENCY_RESTORE",
   "MUTE_TOGGLE",
+  "DETECTION_TOGGLE",
+  "CAPTURE_CLEAN_PLATE",
+  "OPEN_STUDIO",
   "RESET_FRAME",
   "SETTINGS_CHANGED",
   "SETTINGS",
@@ -30,9 +34,11 @@ export interface MessageValidationResult {
 
 /**
  * Runtime validator for messages received across extension contexts
- * (Popup <-> Service Worker <-> Content Script <-> Dashboard Bridge).
+ * (Popup <-> Service Worker <-> Content Script <-> Studio Bridge).
  */
-export function validateExtensionMessage(raw: unknown): MessageValidationResult {
+export function validateExtensionMessage(
+  raw: unknown,
+): MessageValidationResult {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return {
       valid: false,
@@ -90,13 +96,14 @@ export function validateExtensionMessage(raw: unknown): MessageValidationResult 
 interface ChromeRuntimeLike {
   id?: string;
   lastError?: { message?: string };
+  getURL?: (path: string) => string;
   sendMessage?: (
     message: ExtensionMessage,
     callback?: (response: ExtensionResponse) => void,
   ) => void;
 }
 
-function getChromeRuntime(): ChromeRuntimeLike | null {
+export function getChromeRuntime(): ChromeRuntimeLike | null {
   const g = globalThis as unknown as {
     chrome?: { runtime?: ChromeRuntimeLike };
   };
@@ -112,6 +119,21 @@ function getChromeRuntime(): ChromeRuntimeLike | null {
 export function isExtensionRuntimeAvailable(): boolean {
   const rt = getChromeRuntime();
   return Boolean(rt && rt.id);
+}
+
+/**
+ * Resolves a bundled asset path (models/*, wasm/*, vendor/*) in both
+ * Chrome Extension contexts and Vite web contexts.
+ */
+export function resolveBundledAssetUrl(relativePath: string): string {
+  const clean = relativePath.replace(/^\/+/, "");
+  const g = globalThis as unknown as {
+    chrome?: { runtime?: { id?: string; getURL?: (p: string) => string } };
+  };
+  if (g.chrome?.runtime?.id && typeof g.chrome.runtime.getURL === "function") {
+    return g.chrome.runtime.getURL(clean);
+  }
+  return `./${clean}`;
 }
 
 /**
