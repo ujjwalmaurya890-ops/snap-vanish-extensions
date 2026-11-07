@@ -333,7 +333,8 @@ export interface AppErrorRecord {
     | "dismiss";
   severity: "warning" | "error";
   timestamp: string;
-  autoRestoredCamera: boolean;
+  /** A local preview reset was requested, not a confirmed meeting-camera restore. */
+  autoRestoreRequested: boolean;
 }
 
 export type PlatformSupportLevel =

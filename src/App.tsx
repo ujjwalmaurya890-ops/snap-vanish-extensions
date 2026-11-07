@@ -18,8 +18,11 @@ import {
   duplicatePreset,
   loadPresets,
   loadSettings,
+  mergeAndValidateSettings,
   saveCustomPresets,
-  saveSettings,
+  saveSettingsPatch,
+  STORAGE_KEYS,
+  validateSettings,
 } from "./lib/settings";
 import {
   clearAnalyticsData,
@@ -43,6 +46,24 @@ import type {
   SnapSettings,
   UsageAnalyticsSummary,
 } from "./types/snapVanish";
+
+function changedSettingsPatch(previous: SnapSettings, next: SnapSettings, patch: Partial<SnapSettings>): Partial<SnapSettings> {
+  const result: Record<string, unknown> = {};
+  for (const key of Object.keys(patch) as Array<keyof SnapSettings>) {
+    const before = previous[key];
+    const after = next[key];
+    if (after && before && typeof after === "object" && typeof before === "object") {
+      const diff: Record<string, unknown> = {};
+      for (const [nestedKey, value] of Object.entries(after)) {
+        if ((before as unknown as Record<string, unknown>)[nestedKey] !== value) diff[nestedKey] = value;
+      }
+      if (Object.keys(diff).length) result[key] = diff;
+    } else if (before !== after) result[key] = after;
+  }
+  // Sensitivity is intentionally mirrored in the canonical gesture document.
+  if (previous.sensitivity !== next.sensitivity) result.sensitivity = next.sensitivity;
+  return result as Partial<SnapSettings>;
+}
 
 const INITIAL_DETECTION_DIAG: DetectionDiagnosticsState = {
   modelStatus: "unloaded",
@@ -69,6 +90,11 @@ const INITIAL_DETECTION_DIAG: DetectionDiagnosticsState = {
 export function App() {
   const sessionStartedAtRef = useRef<number>(Date.now());
   const [settings, setSettings] = useState<SnapSettings>(DEFAULT_SETTINGS);
+  const settingsRef = useRef<SnapSettings>(DEFAULT_SETTINGS);
+  const localSettingsRevision = useRef(0);
+  const pendingSettingsPatches = useRef<Array<{ patch: Partial<SnapSettings> }>>([]);
+  const [settingsSaveError, setSettingsSaveError] = useState<string | null>(null);
+  const [meetingActionError, setMeetingActionError] = useState<string | null>(null);
   const [presets, setPresets] = useState<EffectPreset[]>(BUILT_IN_PRESETS);
   const [activePresetId, setActivePresetId] = useState<string>(
     BUILT_IN_PRESETS[0]?.id ?? "preset-classic-dust",
@@ -114,6 +140,7 @@ export function App() {
 
   useEffect(() => {
     let mounted = true;
+    const initialRevision = localSettingsRevision.current;
     Promise.all([
       loadSettings(),
       Promise.resolve(loadPresets()),
@@ -122,76 +149,111 @@ export function App() {
       sendExtensionMessage({ type: "GET_STATE" }),
     ]).then(([loadedSettings, loadedPresets, loadedAnalytics, loadedDiag, extRes]) => {
       if (!mounted) return;
-      setSettings(loadedSettings);
+      if (localSettingsRevision.current === initialRevision) {
+        settingsRef.current = loadedSettings;
+        setSettings(loadedSettings);
+      }
       setPresets(loadedPresets);
       setAnalytics(loadedAnalytics);
       setDiagnostics(loadedDiag);
       if (!loadedSettings.onboardingCompleted) {
         setOnboardingOpen(true);
       }
-      if (extRes.ok && extRes.host) {
-        setActivePlatformLabel(`Connected · ${extRes.host}`);
-      }
+      setActivePlatformLabel(extRes.ok && extRes.host
+        ? `Supported tab · ${extRes.host}`
+        : extRes.reason === "multiple-meeting-tabs"
+          ? "Multiple meeting tabs · focus one"
+          : "No reachable meeting tab");
     });
 
-    // Listen for BroadcastChannel cross-tab / popup sync
+    const applyIncoming = (raw: unknown) => {
+      let next = validateSettings(raw, DEFAULT_SETTINGS).sanitized;
+      // Do not let an older storage notification erase edits still in flight.
+      for (const pending of pendingSettingsPatches.current) {
+        next = mergeAndValidateSettings(next, pending.patch).sanitized;
+      }
+      localSettingsRevision.current += 1;
+      settingsRef.current = next;
+      setSettings(next);
+    };
     let ch: BroadcastChannel | null = null;
     try {
       if (typeof BroadcastChannel !== "undefined") {
         ch = new BroadcastChannel("snap_vanish_channel");
         ch.onmessage = (ev) => {
-          if (ev.data?.type === "SETTINGS_UPDATED" && ev.data?.payload) {
-            setSettings(ev.data.payload as SnapSettings);
-          }
+          if (ev.data?.type === "SETTINGS_UPDATED" && ev.data?.payload) applyIncoming(ev.data.payload);
         };
       }
-    } catch {
-      // Ignore if BroadcastChannel unavailable
-    }
+    } catch { /* BroadcastChannel is optional. */ }
 
+    const storageEvents = (globalThis as unknown as {
+      chrome?: { storage?: { onChanged?: {
+        addListener: (listener: (changes: Record<string, { newValue?: unknown }>, area: string) => void) => void;
+        removeListener: (listener: (changes: Record<string, { newValue?: unknown }>, area: string) => void) => void;
+      } } };
+    }).chrome?.storage?.onChanged;
+    const onStorageChanged = (changes: Record<string, { newValue?: unknown }>, area: string) => {
+      const value = changes[STORAGE_KEYS.SETTINGS]?.newValue;
+      if (area === "sync" && value) applyIncoming(value);
+    };
+    storageEvents?.addListener(onStorageChanged);
+    const targetPoll = window.setInterval(() => {
+      if (document.hidden) return;
+      void sendExtensionMessage({ type: "GET_STATE" }, { retries: 0 }).then((result) => {
+        if (!mounted) return;
+        setActivePlatformLabel(result.ok && result.host
+          ? `Supported tab · ${result.host}`
+          : result.reason === "multiple-meeting-tabs"
+            ? "Multiple meeting tabs · focus one"
+            : "No reachable meeting tab");
+      });
+    }, 5000);
     return () => {
       mounted = false;
+      window.clearInterval(targetPoll);
+      storageEvents?.removeListener(onStorageChanged);
       ch?.close();
     };
   }, []);
 
-  const patchSettings = useCallback((patch: Partial<SnapSettings>) => {
-    setSettings((prev) => {
-      const merged: SnapSettings = {
-        ...prev,
-        ...patch,
-        gesture: patch.gesture
-          ? { ...prev.gesture, ...patch.gesture }
-          : prev.gesture,
-        audio: patch.audio ? { ...prev.audio, ...patch.audio } : prev.audio,
-        camera: patch.camera ? { ...prev.camera, ...patch.camera } : prev.camera,
-        shortcuts: patch.shortcuts
-          ? { ...prev.shortcuts, ...patch.shortcuts }
-          : prev.shortcuts,
-      };
-      void saveSettings(merged);
-      void sendExtensionMessage({
-        type: "SETTINGS_CHANGED",
-        payload: merged as unknown as Record<string, unknown>,
-      });
-      return merged;
-    });
+  const persistSettings = useCallback(async (patch: Partial<SnapSettings>, snapshot: SnapSettings) => {
+    const pending = { patch };
+    pendingSettingsPatches.current.push(pending);
+    try {
+      await saveSettingsPatch(patch, snapshot);
+      setSettingsSaveError(null);
+    } catch (error) {
+      setSettingsSaveError(error instanceof Error ? error.message : "Unable to save settings");
+      throw error;
+    } finally {
+      pendingSettingsPatches.current = pendingSettingsPatches.current.filter((entry) => entry !== pending);
+    }
   }, []);
+
+  const patchSettings = useCallback((patch: Partial<SnapSettings>) => {
+    const previous = settingsRef.current;
+    const merged = mergeAndValidateSettings(previous, patch).sanitized;
+    const changed = changedSettingsPatch(previous, merged, patch);
+    if (!Object.keys(changed).length) return;
+    localSettingsRevision.current += 1;
+    settingsRef.current = merged;
+    setSettings(merged);
+    void persistSettings(changed, merged).catch(() => {});
+  }, [persistSettings]);
 
   const handleReplaceAllSettings = useCallback(
     (nextSettings: SnapSettings, nextPresets?: EffectPreset[]) => {
-      setSettings(nextSettings);
-      void saveSettings(nextSettings);
-      void sendExtensionMessage({
-        type: "SETTINGS_CHANGED",
-        payload: nextSettings as unknown as Record<string, unknown>,
-      });
+      const next = validateSettings(nextSettings, DEFAULT_SETTINGS).sanitized;
+      localSettingsRevision.current += 1;
+      settingsRef.current = next;
+      setSettings(next);
+      void persistSettings(next, next).catch(() => {});
       if (nextPresets) {
         const all = saveCustomPresets(nextPresets);
         setPresets(all);
       }
     },
-    [],
+    [persistSettings],
   );
 
   const handleResetDefaults = useCallback(async () => {
@@ -199,15 +261,13 @@ export function App() {
       ...structuredClone(DEFAULT_SETTINGS),
       onboardingCompleted: true,
     };
+    localSettingsRevision.current += 1;
+    settingsRef.current = fresh;
     setSettings(fresh);
-    await saveSettings(fresh);
+    await persistSettings(fresh, fresh).catch(() => {});
     const basePresets = saveCustomPresets([]);
     setPresets(basePresets);
     setActivePresetId(basePresets[0]?.id ?? "preset-classic-dust");
-    void sendExtensionMessage({
-      type: "SETTINGS_CHANGED",
-      payload: fresh as unknown as Record<string, unknown>,
-    });
     const logs = appendDiagnosticLog(
       {
         level: "info",
@@ -217,24 +277,44 @@ export function App() {
       fresh.diagnosticLoggingEnabled,
     );
     setDiagnostics(logs);
+  }, [persistSettings]);
+
+  const sendMeetingCommand = useCallback((type: "SNAP_VANISH_NOW" | "SNAP_RESTORE_NOW" | "EMERGENCY_RESTORE") => {
+    // Never retry a potentially state-changing command after an ambiguous timeout.
+    void sendExtensionMessage({ type }, { retries: 0 }).then((result) => {
+      if (result.ok) { setMeetingActionError(null); return; }
+      const reasons: Record<string, string> = {
+        "multiple-meeting-tabs": "Focus the intended meeting tab before sending a command.",
+        "no-supported-meeting-tab": "No supported meeting tab was found.",
+        "no-verified-camera-preview": "No verified local camera preview was found in the meeting tab.",
+        "restore-incomplete": "Restore failed on one or more meeting tabs. Check your camera immediately.",
+        "restore-required": "Restore the camera before starting another effect.",
+        "extension-context-unavailable": "The extension is unavailable; only the Studio preview can be controlled.",
+      };
+      setMeetingActionError(reasons[result.reason ?? ""] ?? "The meeting command could not be confirmed. Check your meeting camera.");
+    });
   }, []);
+
+  const handlePreviewVanish = useCallback(() => {
+    if (settings.enabled) setSnapSignal((n) => n + 1);
+  }, [settings.enabled]);
 
   const handleTriggerVanish = useCallback(() => {
     if (!settings.enabled) return;
     setSnapSignal((n) => n + 1);
-    void sendExtensionMessage({ type: "SNAP_NOW" });
-  }, [settings.enabled]);
+    sendMeetingCommand("SNAP_VANISH_NOW");
+  }, [settings.enabled, sendMeetingCommand]);
 
   const handleTriggerRestore = useCallback(() => {
     if (!settings.enabled) return;
     setRestoreSignal((n) => n + 1);
-    void sendExtensionMessage({ type: "SNAP_RESTORE_NOW" });
-  }, [settings.enabled]);
+    sendMeetingCommand("SNAP_RESTORE_NOW");
+  }, [settings.enabled, sendMeetingCommand]);
 
   const handleEmergencyRestore = useCallback(() => {
     setEmergencySignal((n) => n + 1);
     setActiveErrors([]);
-    void sendExtensionMessage({ type: "EMERGENCY_RESTORE" });
+    sendMeetingCommand("EMERGENCY_RESTORE");
     const nextAnalytics = recordAnalyticsEvent({
       type: "emergency_restore",
       effect: settings.effect,
@@ -247,13 +327,14 @@ export function App() {
       {
         level: "warn",
         code: "EMERGENCY_RESTORE",
-        message: "Emergency Restore triggered: live camera restored unconditionally",
+        message: "Emergency Restore requested. Verify the camera state in each meeting tab.",
       },
       settings.diagnosticLoggingEnabled,
     );
     setDiagnostics(logs);
   }, [
     activePresetId,
+    sendMeetingCommand,
     settings.diagnosticLoggingEnabled,
     settings.effect,
     settings.recordActivityHistory,
@@ -435,8 +516,8 @@ export function App() {
                 {!settings.enabled
                   ? "Disabled"
                   : status === "gone"
-                    ? "Vanished"
-                    : "Active"}
+                    ? "Preview vanished"
+                    : "Extension enabled"}
               </Badge>
               <span className="hidden font-mono text-[11px] text-[#6c7284] md:inline">
                 {activePlatformLabel}
@@ -489,7 +570,7 @@ export function App() {
               size="sm"
               variant="danger"
               onClick={handleEmergencyRestore}
-              title="Emergency Camera & Mic Restore (Alt+Shift+R)"
+              title="Request camera restore on all meeting tabs; microphone state is unchanged (Alt+Shift+R)"
             >
               <RotateCcw className="h-3.5 w-3.5" />
               <span>Emergency Restore</span>
@@ -502,6 +583,16 @@ export function App() {
         id="top"
         className="mx-auto max-w-[1280px] space-y-6 px-4 py-6 sm:px-6 lg:px-8"
       >
+        {settingsSaveError && (
+          <div role="alert" className="rounded-xl border border-amber-500/40 bg-amber-950/30 p-3 text-sm text-amber-100">
+            Settings could not be synced: {settingsSaveError}. Your local changes may not reach meeting tabs.
+          </div>
+        )}
+        {meetingActionError && (
+          <div role="alert" className="rounded-xl border border-amber-500/40 bg-amber-950/30 p-3 text-sm text-amber-100">
+            {meetingActionError}
+          </div>
+        )}
         <section className="space-y-4">
           <div className="flex flex-wrap items-end justify-between gap-4">
             <div>
@@ -539,9 +630,10 @@ export function App() {
             maxParticles={settings.maxParticles}
             fullSettings={settings}
             liveCameraRequested={liveCameraRequested}
-            onLiveCameraChange={(active, resolution) =>
-              setLiveCameraInfo({ active, resolution })
-            }
+            onLiveCameraChange={(active, resolution) => {
+              setLiveCameraInfo({ active, resolution });
+              setLiveCameraRequested(active);
+            }}
             onAudioMonitorChange={(active, levelPercent, currentDb, floorDb) =>
               setAudioMonitor({ active, levelPercent, currentDb, floorDb })
             }
@@ -595,6 +687,7 @@ export function App() {
           onDuplicatePreset={handleDuplicatePreset}
           onDeletePreset={handleDeletePreset}
           onTriggerVanish={handleTriggerVanish}
+          onPreviewEffect={handlePreviewVanish}
           onTriggerRestore={handleTriggerRestore}
           onEmergencyRestore={handleEmergencyRestore}
           onOpenCalibration={() => setCalibrationOpen(true)}
@@ -619,7 +712,7 @@ export function App() {
         }}
         onRequestLiveCamera={() => setLiveCameraRequested(true)}
         onOpenCalibration={() => setCalibrationOpen(true)}
-        onTriggerDemoVanish={handleTriggerVanish}
+        onTriggerDemoVanish={handlePreviewVanish}
         onTriggerEmergencyRestore={handleEmergencyRestore}
       />
 

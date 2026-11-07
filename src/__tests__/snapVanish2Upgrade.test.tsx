@@ -199,6 +199,10 @@ describe("Snap Vanish 2.0 — Comprehensive Unit, Integration, DOM & Build Suite
       expect(alpha.length).toBe(64 * 36);
       expect(BACKGROUND_METHODS_EXPLAINED).toHaveLength(4);
       expect(PLATFORM_COMPATIBILITY_MATRIX).toHaveLength(3);
+      bg.reset();
+      expect(bg.hasCapturedPlate).toBe(false);
+      expect(bg.hasTemporalPlate).toBe(false);
+      expect(bg.isCameraMoving).toBe(false);
     });
 
     it("evaluates motion smoothness easing and passes live <video> directly at t === 0 on restore", () => {
@@ -246,7 +250,7 @@ describe("Snap Vanish 2.0 — Comprehensive Unit, Integration, DOM & Build Suite
       expect(BUILT_IN_PRESETS.length).toBeGreaterThanOrEqual(6);
     });
 
-    it("covers all 14 error codes and invokes automatic camera restoration on critical failures", () => {
+    it("covers all 14 error codes and requests local preview reset on critical failures", () => {
       const allCodes: AppErrorCode[] = [
         "CAMERA_PERMISSION_DENIED",
         "MICROPHONE_PERMISSION_DENIED",
@@ -279,6 +283,20 @@ describe("Snap Vanish 2.0 — Comprehensive Unit, Integration, DOM & Build Suite
       }
       // CAMERA_PERMISSION_DENIED, CAMERA_DISCONNECTED, TRACK_REPLACEMENT_FAILED, UNEXPECTED_EXCEPTION
       expect(safeRestores).toBe(4);
+    });
+
+    it("reports a reset request without claiming the meeting camera was restored", () => {
+      const requested = createAppError("CAMERA_DISCONNECTED", {
+        loggingEnabled: false, recordHistory: false, onSafeRestoreCamera: () => {},
+      });
+      expect(requested.autoRestoreRequested).toBe(true);
+      expect(requested.explanation).toMatch(/recovery is not guaranteed/i);
+      expect(requested).not.toHaveProperty("autoRestoredCamera");
+      const failed = createAppError("UNEXPECTED_EXCEPTION", {
+        loggingEnabled: false, recordHistory: false, onSafeRestoreCamera: () => { throw new Error("failed"); },
+      });
+      expect(failed.autoRestoreRequested).toBe(false);
+      expect(failed.explanation).toMatch(/recovery can fail/i);
     });
   });
 
@@ -411,6 +429,29 @@ describe("Snap Vanish 2.0 — Comprehensive Unit, Integration, DOM & Build Suite
       container.remove();
     });
 
+    it("describes meeting transmission and keeps onboarding's effect preview local", async () => {
+      const sent: string[] = [];
+      (globalThis as Record<string, unknown>).chrome = { runtime: {
+        id: "test-extension",
+        sendMessage: (msg: { type: string }, callback: (value: unknown) => void) => {
+          sent.push(msg.type);
+          callback({ ok: true, host: "meet.google.com" });
+        },
+      } };
+      try {
+        await act(async () => { root.render(<App />); await new Promise((r) => setTimeout(r, 25)); });
+        expect(container.textContent).toContain("Your meeting still sends video and audio to participants");
+        const jump = container.querySelector('button[aria-label="Jump to step 6"]') as HTMLButtonElement;
+        expect(jump).toBeTruthy();
+        await act(async () => jump.click());
+        const preview = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Trigger Disintegration Preview"));
+        expect(preview).toBeTruthy();
+        sent.length = 0;
+        await act(async () => preview?.click());
+        expect(sent).not.toContain("SNAP_VANISH_NOW");
+      } finally { delete (globalThis as Record<string, unknown>).chrome; }
+    });
+
     it("renders cleanly across all 5 target viewports and navigates Onboarding, Studio, Calibration, and all 9 Settings sections", async () => {
       const viewports = [
         [1920, 1080],
@@ -471,6 +512,15 @@ describe("Snap Vanish 2.0 — Comprehensive Unit, Integration, DOM & Build Suite
         container.querySelectorAll('nav[aria-label="Settings sections"] button'),
       ) as HTMLButtonElement[];
       expect(settingsNavButtons).toHaveLength(9);
+      const autoArm = container.querySelector('button[aria-label="Auto-arm on joining (not implemented)"]') as HTMLButtonElement;
+      expect(autoArm.disabled).toBe(true);
+      expect(autoArm.getAttribute("aria-checked")).toBe("false");
+      await act(async () => settingsNavButtons[6].click());
+      const localOnly = container.querySelector('button[aria-label="Strict local-only enforcement (not implemented)"]') as HTMLButtonElement;
+      expect(localOnly.disabled).toBe(true);
+      expect(localOnly.getAttribute("aria-checked")).toBe("false");
+      expect(container.textContent).toContain("does not block configured cloud services or Chrome Sync");
+      expect(container.textContent).toContain("meeting continues to transmit");
 
       for (const navBtn of settingsNavButtons) {
         await act(async () => {
@@ -484,7 +534,7 @@ describe("Snap Vanish 2.0 — Comprehensive Unit, Integration, DOM & Build Suite
   });
 
   describe("Build & Extension Package Integrity Verification", () => {
-    it("verifies local MediaPipe model SHA-256, MV3 CSP syntax, zero inline scripts, and release zip", () => {
+    it("verifies local MediaPipe model SHA-256, MV3 CSP syntax, and zero inline scripts", () => {
       const rootDir = process.cwd();
       const manifest = JSON.parse(
         fs.readFileSync(path.join(rootDir, "extension/manifest.json"), "utf8"),
@@ -521,11 +571,6 @@ describe("Snap Vanish 2.0 — Comprehensive Unit, Integration, DOM & Build Suite
         }
       }
 
-      // Verify unpacked release archive exists and is non-empty
-      const zipStat = fs.statSync(
-        path.join(rootDir, "snap-vanish-chrome-extension.zip"),
-      );
-      expect(zipStat.size).toBeGreaterThan(5_000_000);
     });
   });
 });

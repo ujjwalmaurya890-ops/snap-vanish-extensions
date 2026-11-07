@@ -15,7 +15,7 @@ const ERROR_CATALOG: Record<AppErrorCode, ErrorBlueprint> = {
   CAMERA_PERMISSION_DENIED: {
     title: "Camera Permission Denied",
     explanation:
-      "Browser camera access was blocked. Live hand gesture detection requires camera permission, while Studio Calibration Mode remains usable immediately.",
+      "Browser camera access was blocked. Live hand detection requires permission; synthetic Studio calibration remains available.",
     recoveryLabel: "Retry Camera Access",
     recoveryAction: "retry-camera",
     severity: "warning",
@@ -33,7 +33,7 @@ const ERROR_CATALOG: Record<AppErrorCode, ErrorBlueprint> = {
   CAMERA_DISCONNECTED: {
     title: "Camera Disconnected",
     explanation:
-      "The active video device disconnected or was claimed by another application. Snap Vanish automatically restored your safe live state.",
+      "The active video device disconnected or is unavailable. Check the meeting camera and reconnect the device; recovery is not guaranteed.",
     recoveryLabel: "Reconnect Camera",
     recoveryAction: "retry-camera",
     severity: "error",
@@ -60,7 +60,7 @@ const ERROR_CATALOG: Record<AppErrorCode, ErrorBlueprint> = {
   UNSUPPORTED_BROWSER: {
     title: "Browser Capability Missing",
     explanation:
-      "Your browser is missing required WebAssembly SIMD or MediaDevices APIs. Use Chrome 121+, Edge 121+, or Brave for full extension support.",
+      "A required browser capability may be unavailable. The manifest targets Chrome 121+, but individual browser and meeting-site compatibility must be verified.",
     recoveryLabel: "Use Studio Preview",
     recoveryAction: "switch-fallback",
     severity: "warning",
@@ -78,7 +78,7 @@ const ERROR_CATALOG: Record<AppErrorCode, ErrorBlueprint> = {
   TRACK_REPLACEMENT_FAILED: {
     title: "Outgoing Video Track Replacement Unavailable",
     explanation:
-      "This meeting tab did not expose an outgoing WebRTC video sender. Switched cleanly to local DOM canvas overlay mode and preserved your original camera stream.",
+      "The meeting's camera sender could not be safely replaced. A local-only overlay may be available; check the meeting view and camera status.",
     recoveryLabel: "Restore Live Camera",
     recoveryAction: "emergency-restore",
     severity: "warning",
@@ -114,7 +114,7 @@ const ERROR_CATALOG: Record<AppErrorCode, ErrorBlueprint> = {
   SERVICE_WORKER_RESTART: {
     title: "Extension Service Worker Reawakened",
     explanation:
-      "Chrome suspended the idle background worker and restarted it. Retrying command automatically.",
+      "The extension service worker may have restarted. Check the meeting state before retrying an action.",
     recoveryLabel: "Retry Action",
     recoveryAction: "reconnect-extension",
     severity: "warning",
@@ -123,7 +123,7 @@ const ERROR_CATALOG: Record<AppErrorCode, ErrorBlueprint> = {
   MISSING_RESOURCE: {
     title: "Local Asset Missing",
     explanation:
-      "A local visual asset or model file could not be loaded. Procedural fallback rendering was activated automatically.",
+      "A local visual asset or model file could not be loaded. A Studio preview fallback may be available; automatic detection may remain inactive.",
     recoveryLabel: "Switch to Fallback",
     recoveryAction: "switch-fallback",
     severity: "warning",
@@ -132,7 +132,7 @@ const ERROR_CATALOG: Record<AppErrorCode, ErrorBlueprint> = {
   UNEXPECTED_EXCEPTION: {
     title: "Unexpected Runtime Error",
     explanation:
-      "An unexpected error occurred during processing. Your live camera state has been restored to prevent a frozen call feed.",
+      "An unexpected error occurred. Check the meeting camera and request Emergency Restore if needed; recovery can fail.",
     recoveryLabel: "Emergency Restore",
     recoveryAction: "emergency-restore",
     severity: "error",
@@ -145,7 +145,7 @@ const ERROR_CATALOG: Record<AppErrorCode, ErrorBlueprint> = {
  * 1. Classifies the failure into one of 14 canonical error codes
  * 2. Generates a user-friendly explanation + concrete recovery action
  * 3. Logs only non-sensitive diagnostic metadata
- * 4. Invokes automatic camera state restoration whenever safety requires it
+ * 4. Requests a local preview reset on selected failures; it does not verify meeting restoration
  */
 export function createAppError(
   code: AppErrorCode,
@@ -158,9 +158,11 @@ export function createAppError(
 ): AppErrorRecord {
   const bp = ERROR_CATALOG[code] ?? ERROR_CATALOG.UNEXPECTED_EXCEPTION;
 
+  let autoRestoreRequested = false;
   if (bp.shouldAutoRestoreCamera && options.onSafeRestoreCamera) {
     try {
       options.onSafeRestoreCamera();
+      autoRestoreRequested = true;
     } catch {
       // Never throw inside recovery path
     }
@@ -196,9 +198,8 @@ export function createAppError(
     recoveryAction: bp.recoveryAction,
     severity: bp.severity,
     timestamp: new Date().toISOString(),
-    autoRestoredCamera: Boolean(
-      bp.shouldAutoRestoreCamera && options.onSafeRestoreCamera,
-    ),
+    // The callback only requests a local reset; it cannot confirm a meeting track.
+    autoRestoreRequested,
   };
 }
 

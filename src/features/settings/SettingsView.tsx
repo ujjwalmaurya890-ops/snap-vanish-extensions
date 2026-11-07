@@ -280,16 +280,17 @@ export default function SettingsView({
               />
               <div className="border-t border-white/[0.06] pt-4">
                 <Switch
-                  label="Auto-Arm When Joining Video Call"
-                  description="Automatically initializes local detection when joining Google Meet, Microsoft Teams, or Zoom Web."
-                  checked={settings.autoStartOnCall}
-                  onChange={(v) => onPatchSettings({ autoStartOnCall: v })}
+                  label="Auto-arm on joining (not implemented)"
+                  description="This legacy preference is stored but does not control startup. Use the master switch and detection mode instead."
+                  checked={false}
+                  disabled
+                  onChange={() => {}}
                 />
               </div>
               <div className="border-t border-white/[0.06] pt-4">
                 <Switch
                   label="Show Non-Intrusive Meeting HUD"
-                  description="Displays a minimal corner status pill in supported meeting tabs so you always know whether your camera is live or vanished."
+                  description="Displays meeting controls and the observed effect mode. A local tile overlay is not visible to other participants."
                   checked={settings.showCallHud}
                   onChange={(v) => onPatchSettings({ showCallHud: v })}
                 />
@@ -374,8 +375,9 @@ export default function SettingsView({
                   21-Point Hand Landmark &amp; Snap Kinematic Engine
                 </h2>
                 <p className="mt-1 text-[13px] text-[#8b92a5]">
-                  Powered locally by MediaPipe HandLandmarker WASM with adaptive
-                  landmark smoothing and multi-phase snap state verification.
+                  Both surfaces use local MediaPipe landmarks. Studio uses a
+                  multi-phase detector; in-call detection uses a separate, simpler
+                  threshold and may behave differently.
                 </p>
               </div>
               <Button variant="primary" onClick={onOpenCalibration}>
@@ -413,7 +415,7 @@ export default function SettingsView({
                     {
                       id: "smart",
                       name: "Smart Mode",
-                      desc: "Visual snap gesture confirmed by the acoustic snap transient. Fewest false triggers.",
+                      desc: "Visual snap with acoustic confirmation when required. If audio is unavailable, detection stays inactive.",
                     },
                     {
                       id: "gesture-only",
@@ -503,7 +505,7 @@ export default function SettingsView({
 
             <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
               <RangeControl
-                label="Gesture Sensitivity"
+                label="Studio Gesture Sensitivity"
                 displayValue={`${settings.gesture.sensitivity}/100`}
                 min={1}
                 max={100}
@@ -538,7 +540,7 @@ export default function SettingsView({
                 }
               />
               <RangeControl
-                label="Landmark Temporal Smoothing"
+                label="Studio Landmark Temporal Smoothing"
                 displayValue={`${Math.round(settings.gesture.landmarkSmoothing * 100)}%`}
                 min={0}
                 max={85}
@@ -574,6 +576,7 @@ export default function SettingsView({
               />
               <SelectField
                 label="Confirmed Snap Action Mapping"
+                hint="In-call mute-only never unmutes. Studio gestures only affect the preview."
                 value={settings.gesture.actionMapping}
                 onChange={(e) =>
                   onPatchSettings({
@@ -594,8 +597,8 @@ export default function SettingsView({
 
               <div className="rounded-xl border border-white/[0.07] bg-[#181b23] p-3.5">
                 <Switch
-                  label="Accidental Trigger Protection"
-                  description="Rejects hand waves, face touches, and rigid wrist shakes."
+                  label="Studio Accidental Trigger Protection"
+                  description="Helps reject hand waves, face touches, and wrist shakes in the Studio detector; it does not guarantee zero false triggers."
                   checked={settings.gesture.accidentalTriggerProtection}
                   onChange={(v) =>
                     onPatchSettings({
@@ -620,16 +623,17 @@ export default function SettingsView({
                 Camera Pipeline &amp; Background Reconstruction
               </h2>
               <p className="mt-1 text-[13px] text-[#8b92a5]">
-                Configure video input selection, resolution, microphone mute
-                pairing, and how your empty room background is reconstructed.
+                Choose the Studio preview camera and background method. In-call
+                camera selection remains controlled by your meeting; mute and
+                restore options below apply to supported meeting tabs.
               </p>
             </div>
 
             <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
               <SelectField
-                label="Preferred Video Input Device"
+                label="Studio Video Input Device"
                 value={settings.camera.preferredDeviceId}
-                hint="Uses system default webcam until a specific device is selected"
+                hint="Used by the Studio preview, not the meeting camera"
                 onChange={(e) =>
                   onPatchSettings({
                     camera: {
@@ -648,9 +652,9 @@ export default function SettingsView({
               </SelectField>
 
               <SelectField
-                label="Target Processing Resolution"
+                label="Studio Preview Resolution"
                 value={settings.camera.targetResolution}
-                hint="720p HD balances crisp particle edges with low GPU overhead"
+                hint="A request to the Studio camera; the actual resolution may differ"
                 onChange={(e) =>
                   onPatchSettings({
                     camera: {
@@ -681,7 +685,7 @@ export default function SettingsView({
               <div className="border-t border-white/[0.06] pt-4">
                 <Switch
                   label="Auto-Mute Call Microphone While Vanished"
-                  description="Clicks the meeting platform's native mute toggle when vanishing and restores your prior mic state on return."
+                  description="Attempts to mute a recognized meeting microphone control when vanishing. Returning never unmutes automatically; use the meeting control to unmute when ready."
                   checked={settings.muteOnVanish}
                   onChange={(v) => onPatchSettings({ muteOnVanish: v })}
                 />
@@ -689,7 +693,7 @@ export default function SettingsView({
               <div className="border-t border-white/[0.06] pt-4">
                 <Switch
                   label="Auto-Restore Live Camera When Leaving Call"
-                  description="Ensures original hardware camera stream is restored whenever a meeting ends or reloads."
+                  description="Attempts to restore changed camera senders on tab teardown. Restoration can fail; check the meeting's camera controls."
                   checked={settings.camera.autoRestoreOnLeave}
                   onChange={(v) =>
                     onPatchSettings({
@@ -702,8 +706,9 @@ export default function SettingsView({
 
             <div className="space-y-3">
               <div className="text-[13.5px] font-semibold text-white">
-                Background Reconstruction Strategy
+                Studio Background Reconstruction Strategy
               </div>
+              <p className="text-[12px] text-[#9ca3b8]">In calls, use the popup or HUD to capture and review a separate plate; otherwise the effect uses a solid background.</p>
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 {BACKGROUND_METHODS_EXPLAINED.map((info) => {
                   const selected = settings.camera.backgroundMode === info.id;
@@ -754,9 +759,9 @@ export default function SettingsView({
                 Acoustic Snap Confirmation Engine
               </h2>
               <p className="mt-1 text-[13px] text-[#8b92a5]">
-                Analyzes 1.8–4.2 kHz acoustic transients in volatile RAM to
-                confirm physical finger snaps. Audio is never recorded, stored,
-                or transmitted.
+                Analyzes audio transients locally to confirm visual snap gestures.
+                The extension does not record or upload this monitor audio; your
+                meeting provider still transmits meeting audio.
               </p>
             </div>
 
@@ -784,22 +789,9 @@ export default function SettingsView({
                   }
                 />
               </div>
-              <div className="border-t border-white/[0.06] pt-4">
-                <Switch
-                  label="Allow Standalone Audio Trigger (Off-Camera Snap)"
-                  description="Optional mode: triggers vanish from sharp snap transients even when your hand is outside the camera frame. Disabled by default to prevent desk-tap false positives."
-                  checked={settings.audio.allowStandaloneAudioTrigger}
-                  disabled={!settings.audio.enabled}
-                  onChange={(v) =>
-                    onPatchSettings({
-                      audio: {
-                        ...settings.audio,
-                        allowStandaloneAudioTrigger: v,
-                      },
-                    })
-                  }
-                />
-              </div>
+              <p className="border-t border-white/[0.06] pt-4 text-[12px] text-[#9ca3b8]">
+                Sound alone cannot trigger vanish. If Smart mode requires audio and this monitor is disabled or unavailable, automatic detection stays inactive. Select Gesture mode to opt out.
+              </p>
             </div>
 
             <div className="rounded-xl border border-white/[0.07] bg-[#181b23] p-4">
@@ -823,7 +815,8 @@ export default function SettingsView({
 
             <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
               <SelectField
-                label="Audio Input Device"
+                label="Studio Audio Input Device"
+                hint="The in-call confirmation monitor requests the browser's default input separately."
                 value={settings.audio.preferredDeviceId}
                 disabled={!settings.audio.enabled}
                 onChange={(e) =>
@@ -921,7 +914,7 @@ export default function SettingsView({
                 onChange={(v) => onPatchSettings({ duration: v })}
               />
               <RangeControl
-                label="Motion Smoothness Curve"
+                label="Studio Motion Smoothness Curve"
                 displayValue={`${settings.motionSmoothness}%`}
                 min={0}
                 max={100}
@@ -960,15 +953,15 @@ export default function SettingsView({
                 Laptop Battery, GPU &amp; Particle Pool Budgets
               </h2>
               <p className="mt-1 text-[13px] text-[#8b92a5]">
-                Engineered for smooth real-time operation alongside WebRTC video
-                encoding on everyday Windows and macOS laptops.
+                Adjust processing budgets for the Studio and meeting tab.
+                Actual performance depends on the device, site, and workload.
               </p>
             </div>
 
             <div className="space-y-4 rounded-xl border border-white/[0.07] bg-[#181b23] p-4">
               <Switch
                 label="Low-Power Laptop Mode"
-                description="Halves active particle draw budget, caps CV hand inference to 15 Hz, and skips secondary ember glow passes to conserve battery."
+                description="Reduces rendering work and inference rates; the Studio and meeting pipelines apply different caps."
                 checked={settings.lowPowerMode}
                 onChange={(v) =>
                   onPatchSettings({
@@ -995,7 +988,7 @@ export default function SettingsView({
                 max={30}
                 step={2}
                 value={settings.gesture.inferenceFpsLimit}
-                hint="24 Hz captures fast snaps cleanly while leaving GPU headroom for WebRTC"
+                hint="A target cap, not a guarantee. The meeting fallback samples at most 8 times per second and can miss fast gestures."
                 onChange={(v) =>
                   onPatchSettings({
                     gesture: { ...settings.gesture, inferenceFpsLimit: v },
@@ -1022,11 +1015,11 @@ export default function SettingsView({
             <div>
               <div className="rail text-[#ff9d80]">SECTION 07 · PRIVACY</div>
               <h2 className="mt-1 text-[20px] font-semibold text-white">
-                Verified Local-Only Privacy Controls
+                Privacy &amp; Data Controls
               </h2>
               <p className="mt-1 text-[13px] text-[#8b92a5]">
-                Every privacy claim below corresponds directly to auditable
-                source code in this repository.
+                The effect runs locally, but your meeting continues to transmit
+                video and audio. Chrome may sync preferences across your profile.
               </p>
             </div>
 
@@ -1036,10 +1029,10 @@ export default function SettingsView({
                   CAMERA &amp; MIC DATA
                 </div>
                 <div className="mt-1 text-[13px] font-semibold text-white">
-                  RAM-Only · Never Recorded
+                  Local Effect Processing
                 </div>
                 <p className="mt-1 text-[11.5px] text-emerald-100/75">
-                  No MediaRecorder, no cloud endpoints, no frame persistence.
+                  Detection frames and monitor audio are not recorded or uploaded by the extension. The meeting still transmits media; an approved plate may be shown.
                 </p>
               </div>
               <div className="rounded-xl border border-emerald-500/25 bg-emerald-500/10 p-3.5">
@@ -1050,7 +1043,7 @@ export default function SettingsView({
                   100% Bundled Locally
                 </div>
                 <p className="mt-1 text-[11.5px] text-emerald-100/75">
-                  MediaPipe WASM &amp; TFLite load from chrome-extension:// URLs.
+                  Bundled MediaPipe assets load from the extension or Studio host; CSP fallback frames are processed in an extension document.
                 </p>
               </div>
               <div className="rounded-xl border border-emerald-500/25 bg-emerald-500/10 p-3.5">
@@ -1061,17 +1054,18 @@ export default function SettingsView({
                   Sync vs Local Isolated
                 </div>
                 <p className="mt-1 text-[11.5px] text-emerald-100/75">
-                  Logs stay in chrome.storage.local and never enter sync.
+                  Studio logs use local browser storage; preferences may sync through Chrome.
                 </p>
               </div>
             </div>
 
             <div className="space-y-4 rounded-xl border border-white/[0.07] bg-[#181b23] p-4">
               <Switch
-                label="Strict Local-Only Enforcement"
-                description="Blocks any optional remote sync endpoints so 100% of processing stays offline-capable."
-                checked={settings.strictLocalOnly}
-                onChange={(v) => onPatchSettings({ strictLocalOnly: v })}
+                label="Strict local-only enforcement (not implemented)"
+                description="This legacy preference does not block configured cloud services or Chrome Sync. Review your build configuration and Chrome sync settings."
+                checked={false}
+                disabled
+                onChange={() => {}}
               />
               <div className="border-t border-white/[0.06] pt-4">
                 <Switch
@@ -1132,7 +1126,7 @@ export default function SettingsView({
                   action: "vanish" as const,
                 },
                 {
-                  title: "Emergency Camera & Mic Restore",
+                  title: "Emergency Camera Restore (mic unchanged)",
                   keys: ["Alt", "Shift", "R"],
                   action: "restore" as const,
                 },

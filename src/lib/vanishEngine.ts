@@ -274,8 +274,8 @@ export class VanishEngineController {
   }
 
   /**
-   * Emergency Restore — unconditionally recovers the live camera feed and unmutes
-   * from ANY state (including mid-transition, vanished, error, or disabled).
+   * Reset this standalone controller's simulated state from any phase. This
+   * does not restore a meeting sender or change a meeting microphone.
    */
   emergencyRestore(): EngineTransitionResult {
     const prev = this.state;
@@ -324,7 +324,7 @@ export class VanishEngineController {
 
   /**
    * Invoked when a camera/mic track ends unexpectedly or permission is revoked.
-   * Ensures safe recovery rather than leaving a stuck vanished state.
+   * Resets this local state machine; it does not prove meeting-camera recovery.
    */
   handleTrackEnded(track?: MediaStreamTrack): EngineTransitionResult {
     const prev = this.state;
@@ -333,7 +333,7 @@ export class VanishEngineController {
     this.progress = 0;
     this.state = "error";
     this.lastError = track
-      ? `Media track (${track.kind}) ended unexpectedly. Restored safe state.`
+      ? `Media track (${track.kind}) ended unexpectedly. Local preview reset; check the meeting camera.`
       : "Camera/microphone permission was revoked or device disconnected.";
     this.notify();
     return {
