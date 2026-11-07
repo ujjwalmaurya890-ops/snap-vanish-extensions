@@ -31,6 +31,13 @@ const MAX_UNPACKED_MB = 30;
 
 const ALLOWED_PERMISSIONS = new Set(["storage", "offscreen"]);
 const ALLOWED_HOST_RE = /^https:\/\/(\*\.)?[a-z0-9-]+(\.[a-z0-9-]+)+\/.+$/i;
+// WAR matches are origin-wide in Chrome: the only valid path is exactly /*.
+// Limit them to HTTPS DNS origins (with an optional leading subdomain wildcard).
+const DNS_LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
+const ALLOWED_WAR_MATCH_RE = new RegExp(
+  `^https://(?:\\*\\.)?${DNS_LABEL}(?:\\.${DNS_LABEL})+/\\*$`,
+  "i",
+);
 
 function fail(message) {
   console.error(`\n✗ ${message}\n`);
@@ -132,18 +139,30 @@ if (illegalPermissions.length > 0) {
   );
 }
 
-const hostPermissions = manifest.host_permissions || [];
-if (hostPermissions.length === 0) {
+const hostPermissions = manifest.host_permissions;
+if (!Array.isArray(hostPermissions) || hostPermissions.length === 0) {
   fail("host_permissions must enumerate the supported meeting origins");
 }
 for (const pattern of hostPermissions) {
-  if (pattern === "<all_urls>" || !ALLOWED_HOST_RE.test(pattern)) {
+  if (typeof pattern !== "string" || !ALLOWED_HOST_RE.test(pattern)) {
     fail(`Over-broad host permission: ${pattern}`);
   }
 }
 
+// Host-permission paths are ignored by Chrome. Compare the origins, not their
+// paths, when ensuring that WAR exposure does not add an undeclared host.
+const permittedOrigins = new Set(
+  hostPermissions.map((pattern) =>
+    pattern.slice(0, pattern.indexOf("/", "https://".length)).toLowerCase(),
+  ),
+);
+
 // --- Web accessible resources ---------------------------------------------
-for (const entry of manifest.web_accessible_resources || []) {
+const webAccessibleResources = manifest.web_accessible_resources;
+if (!Array.isArray(webAccessibleResources) || webAccessibleResources.length === 0) {
+  fail("web_accessible_resources must enumerate the local meeting resources");
+}
+for (const entry of webAccessibleResources) {
   for (const resource of entry.resources) {
     if (resource === "*" || resource === "/*" || resource.endsWith("/*")) {
       fail(
@@ -153,9 +172,19 @@ for (const entry of manifest.web_accessible_resources || []) {
     }
     assertExists(resource);
   }
+  if (!Array.isArray(entry.matches) || entry.matches.length === 0) {
+    fail("Web-accessible resource matches must be a non-empty array of meeting origins");
+  }
   for (const match of entry.matches) {
-    if (match === "<all_urls>" || match === "*://*/*") {
-      fail(`Web accessible resource exposed to all origins: ${match}`);
+    if (typeof match !== "string" || !ALLOWED_WAR_MATCH_RE.test(match)) {
+      fail(
+        `Invalid web-accessible resource match '${match}': ` +
+          `use an HTTPS origin with the exact path '/*'.`,
+      );
+    }
+    const origin = match.slice(0, -2).toLowerCase();
+    if (!permittedOrigins.has(origin)) {
+      fail(`Web-accessible resource match '${match}' is not a declared host-permission origin`);
     }
   }
 }

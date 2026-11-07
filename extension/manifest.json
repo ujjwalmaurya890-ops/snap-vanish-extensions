@@ -79,8 +79,8 @@
         "https://meet.google.com/*",
         "https://teams.microsoft.com/*",
         "https://teams.live.com/*",
-        "https://*.zoom.us/wc/*",
-        "https://app.zoom.us/wc/*"
+        "https://*.zoom.us/*",
+        "https://app.zoom.us/*"
       ],
       "use_dynamic_url": false
     }
