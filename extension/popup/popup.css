@@ -205,6 +205,11 @@ html[data-theme="light"] .switch-btn {
   gap: 11px;
 }
 
+.action-error {
+  color: var(--danger-text);
+  line-height: 1.4;
+}
+
 /* Live status grid */
 .status-grid {
   display: grid;

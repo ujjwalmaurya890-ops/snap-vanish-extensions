@@ -76,6 +76,9 @@
   const btnVanish = $("btn-vanish");
   const btnReturn = $("btn-return");
   const btnRestore = $("btn-restore");
+  const btnCapturePlate = $("btn-capture-plate");
+  const btnClearPlate = $("btn-clear-plate");
+  const plateState = $("plate-state");
   const btnOpenStudio = $("btn-open-studio");
   const btnCustomizeKeys = $("btn-customize-keys");
   const modeHint = $("mode-hint");
@@ -92,10 +95,11 @@
 
   function setStat(key, text, tone) {
     const [label, dot] = stat[key];
-    if (label) label.textContent = text;
+    if (label) { label.textContent = text; label.title = text; }
     if (dot) dot.setAttribute("data-tone", tone);
   }
 
+  let settingsError = null;
   let currentSettings = {
     enabled: true,
     sensitivity: 62,
@@ -104,7 +108,7 @@
     gesture: { enabled: true, detectionMode: "smart", sensitivity: 62, requireAudioConfirm: true },
     audio: { enabled: true },
   };
-  let callState = {
+  const emptyCallState = {
     ok: false,
     engineState: "live",
     host: null,
@@ -113,8 +117,9 @@
     handModelReady: false,
     audioGateActive: false,
     detectionActive: false,
-    muted: false,
+    muted: null,
   };
+  let callState = { ...emptyCallState };
 
   function detectionMode() {
     return currentSettings.gesture?.detectionMode || "smart";
@@ -123,103 +128,104 @@
   function renderUI() {
     const enabled = currentSettings.enabled !== false;
     masterToggle.setAttribute("aria-checked", String(enabled));
-    sensRange.value = String(currentSettings.sensitivity || 62);
-    sensVal.textContent = `${currentSettings.sensitivity || 62}/100`;
+    sensRange.value = String(currentSettings.sensitivity ?? 62);
+    sensVal.textContent = `${currentSettings.sensitivity ?? 62}/100`;
     sensRange.disabled = !enabled || detectionMode() === "manual";
     presetSelect.disabled = !enabled;
-
-    if (PRESET_CONFIGS[currentSettings.effect]) {
-      presetSelect.value = currentSettings.effect;
-    }
+    if (PRESET_CONFIGS[currentSettings.effect]) presetSelect.value = currentSettings.effect;
 
     for (const btn of modeButtons) {
-      btn.setAttribute("aria-checked", String(btn.dataset.mode === detectionMode()));
+      const selected = btn.dataset.mode === detectionMode();
+      btn.setAttribute("aria-checked", String(selected));
+      btn.tabIndex = selected ? 0 : -1;
       btn.disabled = !enabled;
     }
-    modeHint.textContent = MODE_HINTS[detectionMode()] || MODE_HINTS.smart;
+    const smartHint = currentSettings.gesture?.requireAudioConfirm === false
+      ? "Audio confirmation is disabled; Smart uses the gesture alone."
+      : currentSettings.audio?.enabled === false
+        ? "Audio is disabled; Smart cannot confirm a gesture."
+        : MODE_HINTS.smart;
+    modeHint.textContent = settingsError || (detectionMode() === "smart" ? smartHint : MODE_HINTS[detectionMode()]) || MODE_HINTS.smart;
 
     const lpOn = Boolean(currentSettings.lowPowerMode);
     lowPowerToggle.setAttribute("data-on", String(lpOn));
+    lowPowerToggle.setAttribute("aria-pressed", String(lpOn));
     lowPowerState.textContent = lpOn ? "ON" : "OFF";
 
-    // Headline status
-    const vanished = callState.engineState === "vanished";
-    const transitioning =
-      callState.engineState === "vanishing" || callState.engineState === "restoring";
-    if (!enabled) {
+    const vanished = callState.ok && callState.engineState === "vanished";
+    const transitioning = callState.ok && (callState.engineState === "vanishing" || callState.engineState === "restoring");
+    if (callState.restoreError) {
+      statusDot.setAttribute("data-tone", "amber");
+      statusText.textContent = "CAMERA RESTORE FAILED";
+    } else if (callState.renderError) {
+      statusDot.setAttribute("data-tone", "amber");
+      statusText.textContent = "EFFECT UNAVAILABLE";
+    } else if (!enabled) {
       statusDot.setAttribute("data-tone", "muted");
       statusText.textContent = "PAUSED";
+    } else if (!callState.ok) {
+      statusDot.setAttribute("data-tone", "muted");
+      statusText.textContent = callState.reason === "multiple-meeting-tabs" ? "SELECT A MEETING TAB" : "NO REACHABLE MEETING TAB";
     } else if (vanished) {
       statusDot.setAttribute("data-tone", "amber");
-      statusText.textContent = "VANISHED";
+      statusText.textContent = callState.interceptionMode === "webrtc-sender" ? "EFFECT ON CAMERA" : "LOCAL TILE ONLY";
     } else if (transitioning) {
       statusDot.setAttribute("data-tone", "amber");
-      statusText.textContent =
-        callState.engineState === "vanishing" ? "VANISHING…" : "RETURNING…";
+      statusText.textContent = callState.engineState === "vanishing" ? "VANISHING…" : "RETURNING…";
     } else {
-      statusDot.setAttribute("data-tone", "emerald");
-      statusText.textContent = callState.ok ? "ARMED · LIVE CALL" : "ARMED · NO CALL TAB";
+      statusDot.setAttribute("data-tone", callState.detectionActive ? "emerald" : "muted");
+      statusText.textContent = callState.detectionActive ? "DETECTION ACTIVE" : "SUPPORTED TAB";
     }
+    platformLabel.textContent = callState.ok && callState.host
+      ? callState.host
+      : callState.reason === "multiple-meeting-tabs"
+        ? "Focus the intended meeting tab"
+        : "Open Meet / Teams / Zoom";
 
-    if (callState.ok && callState.host) {
-      const modeTag = callState.interceptionMode === "webrtc-sender" ? "WebRTC" : "Tile";
-      platformLabel.textContent = `${callState.host} · ${modeTag}`;
-    } else {
-      platformLabel.textContent = "Open Meet / Teams / Zoom";
-    }
+    setStat("camera", !callState.ok ? "Unknown" : callState.cameraPresent ? "Preview found" : "Not found",
+      callState.ok && callState.cameraPresent ? "on" : callState.ok ? "warn" : "off");
+    const micLabel = !callState.ok || callState.muted === null ? "Unknown" : callState.muted ? "Muted" : "Unmuted";
+    setStat("mic", callState.audioGateActive ? `${micLabel} · listening` : micLabel,
+      callState.audioGateActive ? "warn" : callState.muted === false ? "on" : "off");
+    setStat("hand", !callState.ok ? "Unknown" : callState.handModelReady ? "Model ready" : callState.handModelError ? "Unavailable" : "Not ready",
+      callState.ok && callState.handModelReady ? "on" : "off");
+    const detectionLabels = {
+      active: "Active", manual: "Manual", disabled: "Paused", "paused-hidden": "Tab hidden",
+      "no-camera": "No camera", "model-not-ready": "Model not ready", "model-unavailable": "Model unavailable", "audio-unavailable": "Audio unavailable",
+      "waiting-audio": "Waiting for audio", transitioning: "Transitioning", starting: "Starting",
+    };
+    setStat("detection", !callState.ok ? "Unknown" : detectionLabels[callState.detectionStatus] || "Not ready",
+      callState.ok && callState.detectionActive ? "on" : "off");
+    setStat("anim", !callState.ok ? "Unknown" :
+      ({ live: "Live", vanishing: "Vanishing", vanished: "Vanished", restoring: "Returning" }[callState.engineState] || "Unknown"),
+      !callState.ok ? "off" : vanished || transitioning ? "warn" : "on");
+    const streamLabel = !callState.ok ? "Unknown" : callState.restoreError ? "Restore failed" : callState.renderError ? "Effect unavailable" :
+      callState.engineState === "live" ? (callState.interceptionMode === "webrtc-sender" ? "Restore pending" : "No effect") :
+      callState.interceptionMode === "webrtc-sender" ? "Effect sent" : "Local tile only";
+    setStat("stream", streamLabel, !callState.ok ? "off" : callState.restoreError || callState.renderError || streamLabel === "Local tile only" || streamLabel === "Restore pending" ? "warn" : "on");
 
-    // Live status grid — every value derives from GET_STATE / settings.
-    setStat(
-      "camera",
-      !callState.ok ? "No call tab" : callState.cameraPresent ? "Connected" : "Not found",
-      callState.cameraPresent ? "on" : callState.ok ? "warn" : "off",
-    );
-    setStat(
-      "mic",
-      callState.muted
-        ? "Muted by SV"
-        : callState.audioGateActive
-          ? "Snap-listen on"
-          : "Not monitored",
-      callState.muted ? "warn" : callState.audioGateActive ? "on" : "off",
-    );
-    setStat(
-      "hand",
-      callState.handModelReady ? "Model ready" : "Loads on demand",
-      callState.handModelReady ? "on" : "off",
-    );
-    setStat(
-      "detection",
-      !enabled
-        ? "Paused"
-        : detectionMode() === "manual"
-          ? "Manual"
-          : callState.detectionActive
-            ? "Active"
-            : "Idle",
-      callState.detectionActive && enabled ? "on" : "off",
-    );
-    setStat(
-      "anim",
-      { live: "Live", vanishing: "Vanishing", vanished: "Vanished", restoring: "Returning" }[
-        callState.engineState
-      ] || "Live",
-      vanished || transitioning ? "warn" : "on",
-    );
-    setStat(
-      "stream",
-      callState.interceptionMode === "webrtc-sender" ? "WebRTC sender" : "Tile overlay",
-      callState.interceptionMode === "webrtc-sender" ? "on" : "off",
-    );
+    micToggle.disabled = !callState.ok || typeof callState.muted !== "boolean";
+    micToggle.setAttribute("data-on", String(callState.muted === false));
+    micToggle.setAttribute("aria-pressed", String(callState.muted === false));
+    micToggle.setAttribute("data-warn", String(callState.muted === true));
+    micState.textContent = micLabel.toUpperCase();
 
-    // Mic pill reflects extension-caused mute only (never guesses host state).
-    micToggle.disabled = !callState.ok;
-    micToggle.setAttribute("data-on", String(!callState.muted));
-    micToggle.setAttribute("data-warn", String(Boolean(callState.muted)));
-    micState.textContent = !callState.ok ? "—" : callState.muted ? "MUTED" : "LIVE";
-
-    btnVanish.disabled = !enabled || !callState.ok || vanished || transitioning;
-    btnReturn.disabled = !enabled || !callState.ok || (!vanished && !transitioning);
+    const capturing = callState.cleanPlateStatus === "countdown";
+    const awaitingReview = callState.cleanPlateStatus === "review";
+    btnCapturePlate.textContent = capturing ? "Cancel capture" : awaitingReview ? "Review plate" : "Capture plate";
+    btnCapturePlate.disabled = !callState.ok || (!capturing && (!enabled || !callState.cameraPresent || callState.engineState !== "live" || Boolean(callState.restoreError)));
+    btnClearPlate.disabled = !callState.ok || (!capturing && !awaitingReview && callState.cleanPlateStatus !== "captured");
+    plateState.textContent = !callState.ok ? "Meeting background unknown." : capturing
+      ? `Capturing in ${callState.cleanPlateRemaining || 1}s — step out of frame.`
+      : callState.cleanPlateError && callState.cleanPlateError !== "cancelled"
+        ? "Capture was interrupted or failed; try again in the focused meeting tab."
+        : awaitingReview
+          ? "Review the HUD preview and choose ‘Use this plate’; until then a solid background is used."
+          : callState.cleanPlateStatus === "captured"
+            ? "Approved plate kept in tab memory for the next vanish."
+            : "No captured plate; solid background used.";
+    btnVanish.disabled = !enabled || !callState.ok || !callState.cameraPresent || vanished || transitioning || capturing;
+    btnReturn.disabled = !enabled || !callState.ok || (!vanished && !transitioning && !callState.restoreError);
   }
 
   function pushSettingsPatch(patch) {
@@ -230,7 +236,14 @@
       audio: { ...(currentSettings.audio || {}), ...(patch.audio || {}) },
     };
     renderUI();
-    chrome.runtime.sendMessage({ type: "SETTINGS_CHANGED", payload: currentSettings });
+    chrome.runtime.sendMessage({ type: "SETTINGS_CHANGED", payload: patch }, (response) => {
+      if (chrome.runtime.lastError || !response?.ok) {
+        settingsError = "Settings could not be saved. Try again.";
+      } else {
+        settingsError = null;
+      }
+      renderUI();
+    });
   }
 
   /* ----- Theme (popup-local preference) ----- */
@@ -264,8 +277,8 @@
   }
 
   /* ----- Settings ----- */
-  chrome.storage.sync.get(null, (stored) => {
-    const s = stored?.snap_vanish_settings_v2 || stored || {};
+  function applyStoredSettings(s) {
+    if (!s || typeof s !== "object") return;
     currentSettings = {
       ...currentSettings,
       ...s,
@@ -273,6 +286,14 @@
       audio: { ...currentSettings.audio, ...(s.audio || {}) },
     };
     renderUI();
+  }
+  chrome.storage.sync.get(null, (stored) => {
+    applyStoredSettings(stored?.snap_vanish_settings_v2 || stored || {});
+  });
+  chrome.storage.onChanged?.addListener((changes, area) => {
+    if (area === "sync" && changes.snap_vanish_settings_v2?.newValue) {
+      applyStoredSettings(changes.snap_vanish_settings_v2.newValue);
+    }
   });
 
   chrome.storage.local.get(["snap_vanish_presets_v2"], (res) => {
@@ -291,17 +312,20 @@
     }
   });
 
+  let stateRequestId = 0;
   function refreshCallState() {
+    const requestId = ++stateRequestId;
     chrome.runtime.sendMessage({ type: "GET_STATE" }, (res) => {
-      if (chrome.runtime.lastError || !res) {
-        callState = { ...callState, ok: false, engineState: "live", host: null, interceptionMode: "inactive" };
-      } else {
-        callState = { ...callState, ...res };
-      }
+      if (requestId !== stateRequestId) return;
+      callState = chrome.runtime.lastError || !res?.ok
+        ? { ...emptyCallState, reason: res?.reason || "content-script-unreachable" }
+        : { ...emptyCallState, ...res };
       renderUI();
     });
   }
   refreshCallState();
+  const statusPoll = window.setInterval(() => { if (!document.hidden) refreshCallState(); }, 1500);
+  window.addEventListener("pagehide", () => window.clearInterval(statusPoll), { once: true });
 
   /* ----- Shortcuts (live bindings from Chrome, brief §7) ----- */
   function renderShortcuts() {
@@ -330,7 +354,11 @@
     } catch {
       /* fall through to defaults */
     }
-    apply(Object.entries(fallback).map(([name, shortcut]) => ({ name, shortcut })));
+    for (const name of Object.keys(fallback)) {
+      const el = $(`key-${name}`);
+      if (el) { el.textContent = "Unavailable"; el.setAttribute("data-unset", "true"); }
+    }
+    $("keys-hint").textContent = "Shortcut assignments are unavailable in this context.";
   }
   renderShortcuts();
 
@@ -349,6 +377,14 @@
   });
 
   for (const btn of modeButtons) {
+    btn.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const index = modeButtons.indexOf(btn);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? modeButtons.length - 1 :
+        (index + (event.key === "ArrowRight" || event.key === "ArrowDown" ? 1 : -1) + modeButtons.length) % modeButtons.length;
+      if (!modeButtons[next].disabled) { modeButtons[next].focus(); modeButtons[next].click(); }
+    });
     btn.addEventListener("click", () => {
       const mode = btn.dataset.mode;
       if (mode === "smart") {
@@ -377,33 +413,38 @@
     pushSettingsPatch({ sensitivity: val, gesture: { sensitivity: val, mode: "custom" } });
   });
 
-  micToggle.addEventListener("click", () => {
-    chrome.runtime.sendMessage({ type: "MUTE_TOGGLE" }, () => {
-      setTimeout(refreshCallState, 150);
+  function sendAction(type) {
+    const errorEl = $("action-error");
+    chrome.runtime.sendMessage({ type }, (result) => {
+      const failed = chrome.runtime.lastError || !result?.ok;
+      const reasons = {
+        "multiple-meeting-tabs": "Focus the intended meeting tab, then reopen the popup.",
+        "no-supported-meeting-tab": "No supported meeting tab was found.",
+        "no-verified-camera-preview": "A verified local camera preview was not found.",
+        "restore-incomplete": "Restore failed on one or more tabs. Check your meeting camera immediately.",
+        "restore-required": "Restore the camera before starting another effect.",
+        "focus-meeting-tab": "Focus the meeting tab before capturing a background.",
+        "camera-not-live": "Return to the live camera before capturing a background.",
+        "capture-pending": "Wait for the capture or cancel it before starting an effect.",
+        "rendering-unavailable": "The effect renderer is unavailable; the camera was not replaced.",
+        "content-script-unreachable": "The meeting tab is unreachable. Reload it and try again.",
+      };
+      errorEl.textContent = failed ? (reasons[result?.reason] || "Action could not be completed. Check the meeting tab and try again.") : "";
+      errorEl.hidden = !failed;
+      window.setTimeout(refreshCallState, 200);
     });
-  });
+  }
+  micToggle.addEventListener("click", () => sendAction("MUTE_TOGGLE"));
 
   lowPowerToggle.addEventListener("click", () => {
     pushSettingsPatch({ lowPowerMode: !currentSettings.lowPowerMode });
   });
 
-  btnVanish.addEventListener("click", () => {
-    chrome.runtime.sendMessage({ type: "SNAP_VANISH_NOW" }, () => {
-      setTimeout(refreshCallState, 200);
-    });
-  });
-
-  btnReturn.addEventListener("click", () => {
-    chrome.runtime.sendMessage({ type: "SNAP_RESTORE_NOW" }, () => {
-      setTimeout(refreshCallState, 200);
-    });
-  });
-
-  btnRestore.addEventListener("click", () => {
-    chrome.runtime.sendMessage({ type: "EMERGENCY_RESTORE" }, () => {
-      setTimeout(refreshCallState, 120);
-    });
-  });
+  btnCapturePlate.addEventListener("click", () => sendAction(callState.cleanPlateStatus === "countdown" ? "CANCEL_CLEAN_PLATE" : callState.cleanPlateStatus === "review" ? "REVIEW_CLEAN_PLATE" : "CAPTURE_CLEAN_PLATE"));
+  btnClearPlate.addEventListener("click", () => sendAction("CLEAR_CLEAN_PLATE"));
+  btnVanish.addEventListener("click", () => sendAction("SNAP_VANISH_NOW"));
+  btnReturn.addEventListener("click", () => sendAction("SNAP_RESTORE_NOW"));
+  btnRestore.addEventListener("click", () => sendAction("EMERGENCY_RESTORE"));
 
   btnOpenStudio.addEventListener("click", () => {
     chrome.runtime.sendMessage({ type: "OPEN_STUDIO" });

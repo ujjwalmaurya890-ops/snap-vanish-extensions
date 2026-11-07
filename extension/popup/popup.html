@@ -47,7 +47,7 @@
       <div class="status-strip" role="status" aria-live="polite">
         <div class="status-left">
           <span id="status-dot" class="status-dot"></span>
-          <span id="status-text">ARMED · READY</span>
+          <span id="status-text">CHECKING STATUS…</span>
         </div>
         <span id="platform-label" class="platform-label">Checking call…</span>
       </div>
@@ -109,19 +109,29 @@
             <label for="sens-range" class="field-label">Snap Sensitivity</label>
             <span id="sens-val" class="mono-val">62/100</span>
           </div>
-          <input id="sens-range" type="range" min="1" max="100" value="62" />
+          <input id="sens-range" type="range" min="0" max="100" value="62" />
         </div>
 
         <div class="toggles-grid">
-          <button type="button" id="mic-toggle" class="pill-toggle" data-on="false" title="Toggle your meeting microphone (Alt+Shift+M)">
+          <button type="button" id="mic-toggle" class="pill-toggle" data-on="false" aria-pressed="false" title="Toggle your meeting microphone (Alt+Shift+M)">
             <span>Meeting Mic</span>
             <strong id="mic-state">—</strong>
           </button>
-          <button type="button" id="lowpower-toggle" class="pill-toggle" data-on="false">
+          <button type="button" id="lowpower-toggle" class="pill-toggle" data-on="false" aria-pressed="false">
             <span>Low Power</span>
             <strong id="lowpower-state">OFF</strong>
           </button>
         </div>
+
+        <section class="field" aria-labelledby="plate-label">
+          <span class="field-label" id="plate-label">In-call background plate</span>
+          <span class="field-hint">Focus your meeting tab, start capture, and step out of frame for 5 seconds. Others may see you step away. Review the preview in the meeting HUD and choose “Use this plate”; the extension cannot tell whether it is empty. An approved plate may be sent to participants during the effect. It stays in this tab's memory until cleared, disabled, or reloaded.</span>
+          <div class="actions-row">
+            <button type="button" id="btn-capture-plate" class="btn btn-secondary">Capture plate</button>
+            <button type="button" id="btn-clear-plate" class="btn btn-secondary">Clear plate</button>
+          </div>
+          <span class="field-hint" id="plate-state" role="status" aria-live="polite">No captured plate; solid background used.</span>
+        </section>
 
         <div class="actions-row">
           <button type="button" id="btn-vanish" class="btn btn-primary">Snap Now</button>
@@ -131,10 +141,11 @@
           type="button"
           id="btn-restore"
           class="btn btn-danger btn-wide"
-          title="Unconditionally restores live camera and mic (Alt+Shift+R)"
+          title="Request camera restore on all supported meeting tabs; microphone state is not changed (Alt+Shift+R)"
         >
           Emergency Restore
         </button>
+        <p id="action-error" role="alert" class="action-error" hidden></p>
 
         <section class="shortcuts-box" aria-label="Keyboard shortcuts">
           <div class="shortcuts-head">
@@ -150,7 +161,7 @@
       </main>
 
       <footer class="popup-footer">
-        <span class="privacy-note">🔒 100% local — no uploads</span>
+        <span class="privacy-note" title="If page security blocks in-page hand detection, small transient frames are processed in an extension offscreen document; they are not saved or uploaded.">🔒 Local processing · meeting video still sent</span>
         <button type="button" id="btn-open-studio" class="link-btn">
           Studio &amp; Settings →
         </button>
