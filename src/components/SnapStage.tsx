@@ -82,7 +82,7 @@ const STATUS_COPY: Record<SnapStatus, { label: string; tone: string }> = {
     label: "VANISHING · DISINTEGRATING",
     tone: "text-[#ff9d80]",
   },
-  gone: { label: "VANISHED · CLEAN PLATE ACTIVE", tone: "text-amber-300" },
+  gone: { label: "VANISHED · BACKGROUND SHOWN", tone: "text-amber-300" },
   returning: {
     label: "RESTORING · REASSEMBLING",
     tone: "text-[#ff9d80]",
@@ -172,18 +172,22 @@ function SnapStageImpl({
   const cbRef = useRef({
     onStatus,
     onMetrics,
+    onLiveCameraChange,
     onAudioMonitorChange,
     onDetectionDiagnostics,
     onGestureTriggered,
     onEmergencyRestore,
+    onRaiseError,
   });
   cbRef.current = {
     onStatus,
     onMetrics,
+    onLiveCameraChange,
     onAudioMonitorChange,
     onDetectionDiagnostics,
     onGestureTriggered,
     onEmergencyRestore,
+    onRaiseError,
   };
   const audioClickCtxRef = useRef<AudioContext | null>(null);
   const wakeLoopRef = useRef<(() => void) | null>(null);
@@ -206,6 +210,9 @@ function SnapStageImpl({
   const [measuredFps, setMeasuredFps] = useState<number | null>(null);
   const [measuredMs, setMeasuredMs] = useState<number | null>(null);
   const [liveCameraActive, setLiveCameraActive] = useState(false);
+  const [cameraStarting, setCameraStarting] = useState(false);
+  const cameraStartingRef = useRef(false);
+  const cameraGenerationRef = useRef(0);
   const [cameraResolution, setCameraResolution] = useState<string | null>(null);
   const [showHandOverlay, setShowHandOverlay] = useState(true);
   const [plateCapturedBadge, setPlateCapturedBadge] = useState(false);
@@ -317,65 +324,80 @@ function SnapStageImpl({
   }, []);
 
   const stopLiveCamera = useCallback(() => {
+    cameraGenerationRef.current += 1;
+    cameraStartingRef.current = false;
+    setCameraStarting(false);
     const vid = videoRef.current;
-    if (vid && vid.srcObject) {
+    if (vid?.srcObject) {
       const stream = vid.srcObject as MediaStream;
-      for (const track of stream.getTracks()) {
-        try {
-          track.stop();
-        } catch {
-          // Ignore
-        }
-      }
+      stream.getTracks().forEach((track) => track.stop());
       vid.srcObject = null;
     }
-    stableAudioEngine.stop();
+    stableHandService.dispose();
+    stableBgReconstructor.reset();
+    if (analysisCanvasRef.current) {
+      analysisCanvasRef.current.width = 0;
+      analysisCanvasRef.current.height = 0;
+    }
+    setPlateCapturedBadge(false);
     latestLandmarksRef.current = { landmarks: null, isCandidate: false };
+    setModelLoadText(null);
     setLiveCameraActive(false);
     setCameraResolution(null);
-    onLiveCameraChange?.(false, null);
-    onAudioMonitorChange?.(false, 0, -90, -60);
-    // Restore studio calibration bitmaps for preview mode
-    const load = (src: string) =>
-      new Promise<HTMLImageElement | null>((resolve) => {
-        const img = new Image();
-        img.onload = () => resolve(img);
-        img.onerror = () => resolve(null);
-        img.src = src;
-      });
+    cbRef.current.onLiveCameraChange?.(false, null);
+    // Detection and audio monitoring never outlive the live camera preview.
+    stableAudioEngine.stop();
+    cbRef.current.onAudioMonitorChange?.(false, 0, -90, -60);
+    cbRef.current.onDetectionDiagnostics?.({
+      modelStatus: "unloaded", modelLoadProgress: 0, modelError: null,
+      handDetected: false, handedness: null, landmarkConfidence: 0,
+      gesturePhase: "no-hand", gestureCandidate: false, gestureConfirmed: false,
+      audioConfirmed: false, audioCurrentDb: -90, audioFloorDb: -60,
+      thumbMiddleDistanceMm: 0, approachVelocityMmPerSec: 0,
+      wristOmegaRadPerSec: 0, cooldownRemainingMs: 0, inferenceMs: 0,
+      lastReason: "Camera stopped", processingErrors: [],
+    });
+    const generation = cameraGenerationRef.current;
+    const load = (src: string) => new Promise<HTMLImageElement | null>((resolve) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => resolve(null);
+      image.src = src;
+    });
     void Promise.all([load(roomSrc), load(personSrc)]).then(([room, person]) => {
+      if (generation !== cameraGenerationRef.current) return;
       sceneRef.current?.build(room, person, settingsRef.current.maxParticles);
       wakeLoopRef.current?.();
     });
-  }, [onLiveCameraChange, onAudioMonitorChange]);
+  }, [stableAudioEngine, stableBgReconstructor, stableHandService]);
 
   const startLiveCamera = useCallback(async () => {
-    if (
-      typeof navigator === "undefined" ||
-      !navigator.mediaDevices?.getUserMedia
-    ) {
-      onRaiseError?.("UNSUPPORTED_BROWSER", "navigator.mediaDevices unavailable");
+    if (cameraStartingRef.current || videoRef.current?.srcObject) return;
+    if (!navigator.mediaDevices?.getUserMedia) {
+      cbRef.current.onRaiseError?.("UNSUPPORTED_BROWSER", "navigator.mediaDevices unavailable");
+      cbRef.current.onLiveCameraChange?.(false, null);
       return;
     }
-
+    const generation = ++cameraGenerationRef.current;
+    cameraStartingRef.current = true;
+    setCameraStarting(true);
+    let stream: MediaStream | null = null;
     try {
-      const resTarget =
-        RESOLUTION_MAP[fullSettings?.camera.targetResolution ?? "1280x720"];
+      const target = RESOLUTION_MAP[fullSettings?.camera.targetResolution ?? "1280x720"];
       const videoConstraints: MediaTrackConstraints = {
-        width: { ideal: resTarget.width },
-        height: { ideal: resTarget.height },
+        width: { ideal: target.width }, height: { ideal: target.height },
       };
       if (fullSettings?.camera.preferredDeviceId) {
-        videoConstraints.deviceId = {
-          exact: fullSettings.camera.preferredDeviceId,
-        };
+        videoConstraints.deviceId = { exact: fullSettings.camera.preferredDeviceId };
       }
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: videoConstraints,
-        audio: false,
-      });
-
+      stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
+      if (generation !== cameraGenerationRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      const videoTrack = stream.getVideoTracks()[0];
+      if (!videoTrack) throw new Error("Camera returned no video track");
+      const settings = videoTrack.getSettings();
       let vid = videoRef.current;
       if (!vid) {
         vid = document.createElement("video");
@@ -385,103 +407,81 @@ function SnapStageImpl({
       }
       vid.srcObject = stream;
       await vid.play();
-
-      const track = stream.getVideoTracks()[0];
-      if (track) {
-        track.addEventListener("ended", () => {
-          stopLiveCamera();
-          onRaiseError?.("CAMERA_DISCONNECTED", "Video track ended unexpectedly");
-        });
+      if (generation !== cameraGenerationRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        if (vid.srcObject === stream) vid.srcObject = null;
+        return;
       }
-
-      const resLabel = `${vid.videoWidth || resTarget.width}×${vid.videoHeight || resTarget.height}`;
+      videoTrack.addEventListener("ended", () => {
+        if (generation !== cameraGenerationRef.current || videoRef.current?.srcObject !== stream) return;
+        stopLiveCamera();
+        cbRef.current.onRaiseError?.("CAMERA_DISCONNECTED", "The live camera track ended. Falling back to the local preview placeholder.");
+      }, { once: true });
+      const resolution = `${vid.videoWidth || settings.width || target.width}×${vid.videoHeight || settings.height || target.height}`;
       setLiveCameraActive(true);
-      setCameraResolution(resLabel);
-      onLiveCameraChange?.(true, resLabel);
-
-      // Start live audio confirmation monitor only when the detection policy
-      // allows the microphone (Smart mode). Gesture/Manual never open the mic.
-      const policy = fullSettings
-        ? resolveDetectionPolicy(fullSettings)
-        : null;
-      if (policy?.microphoneAllowed && fullSettings) {
-        const audioRes = await stableAudioEngine.start({
-          preferredDeviceId: fullSettings.audio.preferredDeviceId || undefined,
-          sensitivityDb: fullSettings.audio.sensitivityDb,
-          onDisconnected: () => {
-            onRaiseError?.("MICROPHONE_DISCONNECTED");
-          },
-        });
-        if (!audioRes.ok && audioRes.error) {
-          onRaiseError?.(classifyMediaError(audioRes.error, "microphone"));
-        }
-      }
-
-      // Initialize local MediaPipe HandLandmarker only when automatic
-      // detection is active (never in Manual mode or when disabled).
-      if (policy?.detectionActive) {
-        setModelLoadText("Loading local MediaPipe HandLandmarker…");
-        const initRes = await stableHandService.initialize({
-          minConfidence: fullSettings?.gesture.minHandConfidence ?? 0.62,
-          enableSegmentation:
-            fullSettings?.camera.backgroundMode === "ai-segmentation",
-          onProgress: (pct, stage) => {
-            setModelLoadText(pct < 100 ? `${stage} (${pct}%)` : null);
-            onDetectionDiagnostics?.({
-              modelStatus: pct < 100 ? "loading" : "ready",
-              modelLoadProgress: pct,
-              modelError: null,
-              handDetected: false,
-              handedness: null,
-              landmarkConfidence: 0,
-              gesturePhase: "no-hand",
-              gestureCandidate: false,
-              gestureConfirmed: false,
-              audioConfirmed: false,
-              audioCurrentDb: -90,
-              audioFloorDb: -60,
-              thumbMiddleDistanceMm: 0,
-              approachVelocityMmPerSec: 0,
-              wristOmegaRadPerSec: 0,
-              cooldownRemainingMs: 0,
-              inferenceMs: null,
-              lastReason: stage,
-              processingErrors: [],
-            });
-          },
-        });
-        if (!initRes.ok) {
-          setModelLoadText(null);
-          onRaiseError?.("MODEL_LOAD_FAILED", initRes.error);
-        }
-      }
-
+      setCameraResolution(resolution);
+      cbRef.current.onLiveCameraChange?.(true, resolution);
       wakeLoopRef.current?.();
     } catch (err) {
+      stream?.getTracks().forEach((track) => track.stop());
+      if (generation !== cameraGenerationRef.current) return;
       stopLiveCamera();
-      onRaiseError?.(
-        classifyMediaError(err, "camera"),
-        err instanceof Error ? err.message : String(err),
-      );
+      cbRef.current.onRaiseError?.(classifyMediaError(err, "camera"), err instanceof Error ? err.message : String(err));
+    } finally {
+      if (generation === cameraGenerationRef.current) {
+        cameraStartingRef.current = false;
+        setCameraStarting(false);
+      }
     }
-  }, [
-    fullSettings?.camera.targetResolution,
-    fullSettings?.camera.preferredDeviceId,
-    fullSettings?.camera.backgroundMode,
-    fullSettings?.audio.enabled,
-    fullSettings?.audio.preferredDeviceId,
-    fullSettings?.audio.sensitivityDb,
-    fullSettings?.gesture.enabled,
-    fullSettings?.gesture.detectionMode,
-    fullSettings?.gesture.minHandConfidence,
-    fullSettings?.gesture.requireAudioConfirm,
-    onDetectionDiagnostics,
-    onLiveCameraChange,
-    onRaiseError,
-    stopLiveCamera,
-  ]);
+  }, [stopLiveCamera, fullSettings?.camera.targetResolution, fullSettings?.camera.preferredDeviceId]);
 
-  // Respond to external liveCameraRequested prop
+  const automaticDetectionEnabled = Boolean(fullSettings && resolveDetectionPolicy(fullSettings).detectionActive);
+  const modelConfidence = fullSettings?.gesture.minHandConfidence ?? 0.62;
+  const modelSegmentation = fullSettings?.camera.backgroundMode === "ai-segmentation";
+  useEffect(() => {
+    if (!liveCameraActive || !automaticDetectionEnabled) {
+      stableHandService.dispose();
+      setModelLoadText(null);
+      if (liveCameraActive) {
+        latestLandmarksRef.current = { landmarks: null, isCandidate: false };
+        cbRef.current.onDetectionDiagnostics?.({
+          modelStatus: "unloaded", modelLoadProgress: 0, modelError: null,
+          handDetected: false, handedness: null, landmarkConfidence: 0,
+          gesturePhase: "no-hand", gestureCandidate: false, gestureConfirmed: false,
+          audioConfirmed: false, audioCurrentDb: -90, audioFloorDb: -60,
+          thumbMiddleDistanceMm: 0, approachVelocityMmPerSec: 0,
+          wristOmegaRadPerSec: 0, cooldownRemainingMs: 0, inferenceMs: null,
+          lastReason: "Automatic detection is off", processingErrors: [],
+        });
+      }
+      return;
+    }
+    let cancelled = false;
+    void stableHandService.initialize({
+      minConfidence: modelConfidence,
+      enableSegmentation: modelSegmentation,
+      onProgress: (progress, label) => {
+        if (cancelled) return;
+        setModelLoadText(progress >= 100 || progress === 0 ? null : label);
+        cbRef.current.onDetectionDiagnostics?.({
+          modelStatus: progress >= 100 ? "ready" : progress === 0 ? "error" : "loading",
+          modelLoadProgress: progress, modelError: progress === 0 ? label : null,
+          handDetected: false, handedness: null, landmarkConfidence: 0,
+          gesturePhase: "no-hand", gestureCandidate: false, gestureConfirmed: false,
+          audioConfirmed: false, audioCurrentDb: -90, audioFloorDb: -60,
+          thumbMiddleDistanceMm: 0, approachVelocityMmPerSec: 0,
+          wristOmegaRadPerSec: 0, cooldownRemainingMs: 0, inferenceMs: null,
+          lastReason: label, processingErrors: [],
+        });
+      },
+    }).then((result) => {
+      if (!cancelled && !result.ok && !result.cancelled) {
+        cbRef.current.onRaiseError?.("MODEL_LOAD_FAILED", result.error ?? "HandLandmarker model failed to load.");
+      }
+    });
+    return () => { cancelled = true; stableHandService.dispose(); };
+  }, [liveCameraActive, automaticDetectionEnabled, modelConfidence, modelSegmentation, stableHandService]);
+
   useEffect(() => {
     if (liveCameraRequested && !liveCameraActive) {
       void startLiveCamera();
@@ -489,6 +489,36 @@ function SnapStageImpl({
       stopLiveCamera();
     }
   }, [liveCameraRequested, liveCameraActive, startLiveCamera, stopLiveCamera]);
+
+  const microphoneAllowed = fullSettings ? resolveDetectionPolicy(fullSettings).microphoneAllowed : false;
+  const preferredAudioDevice = fullSettings?.audio.preferredDeviceId;
+  const audioSensitivity = fullSettings?.audio.sensitivityDb;
+  useEffect(() => {
+    let disposed = false;
+    const syncMicrophone = () => {
+      if (!liveCameraActive || !microphoneAllowed || (pauseWhenHidden && document.hidden)) {
+        stableAudioEngine.stop();
+        cbRef.current.onAudioMonitorChange?.(false, 0, -90, -60);
+        return;
+      }
+      void stableAudioEngine.start({
+        preferredDeviceId: preferredAudioDevice || undefined,
+        sensitivityDb: audioSensitivity,
+        onDisconnected: () => cbRef.current.onRaiseError?.("MICROPHONE_DISCONNECTED"),
+      }).then((result) => {
+        if (!disposed && !result.cancelled && !result.ok && result.error) {
+          cbRef.current.onRaiseError?.(classifyMediaError(result.error, "microphone"));
+        }
+      });
+    };
+    syncMicrophone();
+    document.addEventListener("visibilitychange", syncMicrophone);
+    return () => {
+      disposed = true;
+      document.removeEventListener("visibilitychange", syncMicrophone);
+      stableAudioEngine.stop();
+    };
+  }, [liveCameraActive, microphoneAllowed, pauseWhenHidden, preferredAudioDevice, audioSensitivity, stableAudioEngine]);
 
   // Capture explicit clean background plate when requested
   const captureCleanBackgroundPlate = useCallback(() => {
@@ -677,16 +707,6 @@ function SnapStageImpl({
           );
         }
 
-        // Optional standalone audio trigger when explicitly opted in by user
-        if (
-          cfg.audio?.enabled &&
-          cfg.audio?.allowStandaloneAudioTrigger &&
-          audioSnap?.lastTransientAt &&
-          now - audioSnap.lastTransientAt < 90
-        ) {
-          fire();
-        }
-
         if (now - lastInferenceAt >= minIntervalMs) {
           lastInferenceAt = now;
 
@@ -719,10 +739,10 @@ function SnapStageImpl({
                 worldLandmarks: inf.worldLandmarks,
                 handConfidence: inf.confidence,
                 applySmoothing: true,
-                enforceLiveAudioGate: Boolean(
-                  framePolicy.requiresAudioConfirm && audioSnap?.active,
-                ),
-                recentAudioOnsetAt: audioSnap?.lastTransientAt ?? null,
+                // A missing or denied microphone is not permission to bypass
+                // Smart mode's confirmation requirement.
+                enforceLiveAudioGate: framePolicy.requiresAudioConfirm,
+                recentAudioOnsetAt: audioSnap?.active ? audioSnap.lastTransientAt : null,
                 audioConfirmWindowMs: cfg.audio?.confirmWindowMs ?? 220,
               });
 
@@ -921,6 +941,8 @@ function SnapStageImpl({
     // Resolve lazily at teardown: these instances only exist if the user actually
     // enabled the live webcam during this mount.
     return () => {
+      cameraGenerationRef.current += 1;
+      cameraStartingRef.current = false;
       const handSvc = handServiceRef.current;
       const audioEng = audioEngineRef.current;
       const vid = videoRef.current;
@@ -975,7 +997,9 @@ function SnapStageImpl({
     if (emergencySignal > 0) emergencyRestore();
   }, [emergencySignal, emergencyRestore]);
 
-  const statusCopy = STATUS_COPY[status];
+  const statusCopy = !liveCameraActive && status === "idle"
+    ? { label: "STUDIO PREVIEW · CAMERA OFF", tone: "text-[#a1a6b5]" }
+    : STATUS_COPY[status];
 
   return (
     <div className="overflow-hidden rounded-2xl border border-white/[0.08] bg-[#0e1015] shadow-[0_24px_60px_-25px_rgba(0,0,0,0.85)]">
@@ -1011,7 +1035,7 @@ function SnapStageImpl({
           <span className="rail tnum text-[#8b92a5]">
             {measuredFps !== null
               ? `${measuredFps} FPS · ${measuredMs ?? "—"} MS`
-              : "IDLE STANDBY (0% CPU)"}
+              : "STANDBY · NO FRAME METRICS"}
           </span>
         </div>
       </div>
@@ -1060,7 +1084,7 @@ function SnapStageImpl({
 
         <div className="pointer-events-none absolute right-3.5 top-3.5 text-right">
           <div className="rail rounded-md bg-black/65 px-2.5 py-1 text-[#ff9d80] backdrop-blur-sm">
-            100% LOCAL · 0 B EGRESS
+            LOCAL EFFECT PROCESSING
           </div>
           <div className="rail tnum mt-1 text-white/60">
             {count ? count.toLocaleString() : "0"} PARTICLES
@@ -1095,7 +1119,7 @@ function SnapStageImpl({
             type="button"
             onClick={emergencyRestore}
             className="inline-flex items-center gap-1.5 rounded-xl border border-red-500/35 bg-red-500/15 px-3.5 py-2.5 text-[12px] font-medium text-red-200 transition-colors hover:bg-red-500/25"
-            title="Unconditionally restores live camera feed and unmutes microphone (Alt+Shift+R)"
+            title="Attempt to restore the camera; microphone state stays unchanged (Alt+Shift+R)"
           >
             <RotateCcw className="h-3.5 w-3.5" />
             Emergency Restore
@@ -1105,8 +1129,9 @@ function SnapStageImpl({
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
+            aria-pressed={liveCameraActive}
             onClick={() => {
-              if (liveCameraActive) {
+              if (liveCameraActive || cameraStarting) {
                 stopLiveCamera();
               } else {
                 void startLiveCamera();
@@ -1118,10 +1143,10 @@ function SnapStageImpl({
                 : "border-white/10 bg-[#1c1f28] text-[#c9cdd8] hover:border-white/20 hover:text-white"
             }`}
           >
-            {liveCameraActive ? (
+            {liveCameraActive || cameraStarting ? (
               <>
                 <CameraOff className="h-3.5 w-3.5" />
-                Stop Live Webcam
+                {cameraStarting ? "Cancel Camera Request" : "Stop Live Webcam"}
               </>
             ) : (
               <>

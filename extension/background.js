@@ -9,12 +9,10 @@
  * - Offscreen document lifecycle (confirmation cue playback)
  *
  * MV3 LIFECYCLE RULES ENFORCED HERE
- * 1. No mutable module-scope state is used as a source of truth. The worker can
- *    be killed at any moment (idle 30 s, no more than 5 min in the worst case);
- *    every value a handler needs is re-read from `chrome.storage` on demand.
- * 2. The only module-scope mutable value is `offscreenCreating`, a single-flight
- *    promise guard. It is safe because it is re-derived from
- *    `chrome.runtime.getContexts()` before being trusted.
+ * 1. No module-scope value is the source of truth: durable preferences and
+ *    per-tab state are re-read from chrome.storage after a worker restart.
+ * 2. In-memory guards coordinate active offscreen creation and settings writes;
+ *    the stored document remains authoritative when the worker is restarted.
  * 3. Every async `onMessage` handler returns `true` synchronously and calls
  *    `sendResponse` exactly once on every code path (including throws).
  */
@@ -25,13 +23,6 @@ const MEETING_PATTERNS = [
   "https://teams.live.com/*",
   "https://*.zoom.us/wc/*",
   "https://app.zoom.us/wc/*",
-];
-
-const SUPPORTED_HOSTS = [
-  "meet.google.com",
-  "teams.microsoft.com",
-  "teams.live.com",
-  "zoom.us",
 ];
 
 const ALLOWED_TYPES = new Set([
@@ -45,6 +36,9 @@ const ALLOWED_TYPES = new Set([
   "MUTE_TOGGLE",
   "DETECTION_TOGGLE",
   "CAPTURE_CLEAN_PLATE",
+  "REVIEW_CLEAN_PLATE",
+  "CANCEL_CLEAN_PLATE",
+  "CLEAR_CLEAN_PLATE",
   "OPEN_STUDIO",
   "RESET_FRAME",
   "SETTINGS_CHANGED",
@@ -55,25 +49,50 @@ const ALLOWED_TYPES = new Set([
   "CLEAR_LOCAL_DATA",
   "SYNC_DASHBOARD_STATE",
   "PLAY_CUE",
+  "HAND_MODEL_START",
+  "HAND_MODEL_INFER",
+  "HAND_MODEL_RELEASE",
   "OFFSCREEN_EVENT",
 ]);
 
+// Canonical sync document. Defaults mirror src/lib/settings.ts; legacy flat
+// keys are read only when this document does not yet exist.
+const SETTINGS_KEY = "snap_vanish_settings_v2";
 const DEFAULT_SYNC_PREFS = {
+  schemaVersion: 2,
   enabled: true,
-  sensitivity: 62,
-  duration: 1.8,
-  direction: "right",
-  sound: true,
-  effect: "dust",
-  speed: 1.0,
-  particleSize: 1.0,
-  density: 80,
-  colorAccent: "#e0532c",
-  intensity: 85,
-  motionSmoothness: 70,
-  muteOnVanish: true,
-  lowPowerMode: false,
+  autoStartOnCall: true,
   showCallHud: true,
+  hudPosition: "bottom-right",
+  meetingMode: "creative",
+  onboardingCompleted: false,
+  sensitivity: 62,
+  gesture: {
+    enabled: true, detectionMode: "smart", mode: "balanced", sensitivity: 62,
+    minHandConfidence: 0.62, landmarkSmoothing: 0.35, inferenceFpsLimit: 24,
+    cooldownMs: 2000, requireAudioConfirm: true, accidentalTriggerProtection: true,
+    calibratedCollapseThresholdMm: 12, actionMapping: "toggle-vanish",
+  },
+  camera: {
+    preferredDeviceId: "", targetResolution: "1280x720", mirrorPreview: true,
+    backgroundMode: "temporal-plate", autoRestoreOnLeave: true,
+  },
+  sound: true,
+  muteOnVanish: true,
+  audio: {
+    enabled: true, preferredDeviceId: "", sensitivityDb: 12,
+    confirmWindowMs: 220, allowStandaloneAudioTrigger: false,
+  },
+  effect: "dust", direction: "right", duration: 1.8, speed: 1.0,
+  particleSize: 1.0, density: 80, colorAccent: "#d2451e", intensity: 85,
+  motionSmoothness: 70, lowPowerMode: false, performanceProfile: "balanced",
+  pauseWhenHidden: true, maxParticles: 22000, diagnosticLoggingEnabled: true,
+  recordActivityHistory: true, strictLocalOnly: true,
+  shortcuts: {
+    toggleSnap: "Alt+Shift+S", vanishNow: "Alt+Shift+D", restoreCamera: "Alt+Shift+R",
+    toggleDetection: "Alt+Shift+G", openSettings: "Alt+Shift+O",
+    muteOnly: "Alt+Shift+M", emergencyRestore: "Alt+Shift+R",
+  },
 };
 
 /* ------------------------------------------------------------------ *
@@ -111,9 +130,13 @@ const VALID_HUD_POSITIONS = new Set([
 const HEX_COLOR_RE = /^#[0-9a-f]{6}$/i;
 
 function clampNum(value, lo, hi) {
-  const n = typeof value === "number" ? value : Number(value);
-  if (!Number.isFinite(n)) return undefined;
-  return Math.min(hi, Math.max(lo, n));
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return Math.min(hi, Math.max(lo, value));
+}
+
+function clampInt(value, lo, hi) {
+  const number = clampNum(value, lo, hi);
+  return number === undefined ? undefined : Math.round(number);
 }
 
 function pickBool(value) {
@@ -137,11 +160,12 @@ const GESTURE_SPEC = {
   enabled: pickBool,
   detectionMode: (v) => (VALID_TRIGGER_MODES.has(v) ? v : undefined),
   mode: (v) => (VALID_DETECTION_PROFILES.has(v) ? v : undefined),
-  sensitivity: (v) => clampNum(v, 0, 100),
+  actionMapping: (v) => ["toggle-vanish", "vanish-only", "restore-only", "mute-only"].includes(v) ? v : undefined,
+  sensitivity: (v) => clampInt(v, 0, 100),
   minHandConfidence: (v) => clampNum(v, 0.3, 0.95),
   landmarkSmoothing: (v) => clampNum(v, 0, 0.85),
-  inferenceFpsLimit: (v) => clampNum(v, 10, 30),
-  cooldownMs: (v) => clampNum(v, 500, 10000),
+  inferenceFpsLimit: (v) => clampInt(v, 10, 30),
+  cooldownMs: (v) => clampInt(v, 500, 10000),
   requireAudioConfirm: pickBool,
   accidentalTriggerProtection: pickBool,
   calibratedCollapseThresholdMm: (v) => clampNum(v, 6, 25),
@@ -150,8 +174,8 @@ const AUDIO_SPEC = {
   enabled: pickBool,
   preferredDeviceId: (v) =>
     typeof v === "string" ? v.slice(0, 128) : undefined,
-  sensitivityDb: (v) => clampNum(v, 6, 28),
-  confirmWindowMs: (v) => clampNum(v, 100, 500),
+  sensitivityDb: (v) => clampInt(v, 6, 28),
+  confirmWindowMs: (v) => clampInt(v, 100, 500),
   allowStandaloneAudioTrigger: pickBool,
 };
 const CAMERA_SPEC = {
@@ -178,7 +202,9 @@ function sanitizeSettingsPatch(payload) {
     showCallHud: pickBool,
     hudPosition: (v) => (VALID_HUD_POSITIONS.has(v) ? v : undefined),
     onboardingCompleted: pickBool,
-    sensitivity: (v) => clampNum(v, 0, 100),
+    meetingMode: (v) => ["professional", "creative", "minimal", "low-power", "custom"].includes(v) ? v : undefined,
+    performanceProfile: (v) => ["balanced", "high-quality", "low-power"].includes(v) ? v : undefined,
+    sensitivity: (v) => clampInt(v, 0, 100),
     sound: pickBool,
     muteOnVanish: pickBool,
     effect: (v) => (VALID_EFFECTS.has(v) ? v : undefined),
@@ -186,14 +212,14 @@ function sanitizeSettingsPatch(payload) {
     duration: (v) => clampNum(v, 0.5, 4.0),
     speed: (v) => clampNum(v, 0.5, 2.5),
     particleSize: (v) => clampNum(v, 0.5, 3.0),
-    density: (v) => clampNum(v, 20, 100),
+    density: (v) => clampInt(v, 20, 100),
     colorAccent: (v) =>
       typeof v === "string" && HEX_COLOR_RE.test(v) ? v.toLowerCase() : undefined,
-    intensity: (v) => clampNum(v, 10, 100),
-    motionSmoothness: (v) => clampNum(v, 0, 100),
+    intensity: (v) => clampInt(v, 10, 100),
+    motionSmoothness: (v) => clampInt(v, 0, 100),
     lowPowerMode: pickBool,
     pauseWhenHidden: pickBool,
-    maxParticles: (v) => clampNum(v, 4000, 28000),
+    maxParticles: (v) => clampInt(v, 4000, 28000),
     diagnosticLoggingEnabled: pickBool,
     recordActivityHistory: pickBool,
     strictLocalOnly: pickBool,
@@ -206,33 +232,51 @@ function sanitizeSettingsPatch(payload) {
   if (audio) out.audio = audio;
   const camera = sanitizeNested(payload.camera, CAMERA_SPEC);
   if (camera) out.camera = camera;
+  const shortcut = (v) => typeof v === "string" && v.trim().length > 0 && v.trim().length <= 40 ? v.trim() : undefined;
+  const shortcuts = sanitizeNested(payload.shortcuts, {
+    toggleSnap: shortcut, vanishNow: shortcut, restoreCamera: shortcut,
+    toggleDetection: shortcut, openSettings: shortcut, muteOnly: shortcut, emergencyRestore: shortcut,
+  });
+  if (shortcuts) out.shortcuts = shortcuts;
   return out;
+}
+
+function mergeSettings(current, patch) {
+  const merged = { ...current, ...patch };
+  for (const key of ["gesture", "audio", "camera", "shortcuts"]) {
+    merged[key] = { ...(current[key] ?? {}), ...(patch[key] ?? {}) };
+  }
+  const sensitivity = patch.sensitivity ?? patch.gesture?.sensitivity;
+  if (sensitivity !== undefined) {
+    merged.sensitivity = sensitivity;
+    merged.gesture.sensitivity = sensitivity;
+  }
+  return merged;
 }
 
 const BADGE = {
   off: { text: "OFF", color: "#3f3f46" },
   on: { text: "ON", color: "#e0532c" },
-  gone: { text: "GONE", color: "#d97706" },
 };
 
 const OFFSCREEN_PATH = "offscreen/offscreen.html";
-/** `AUDIO_PLAYBACK` docs are auto-reclaimed by Chrome after ~30 s of silence. */
-const OFFSCREEN_REASONS = ["AUDIO_PLAYBACK"];
+// BLOBS is used to decode transient, locally processed camera frames when a
+// meeting's CSP prevents WebAssembly in the content-script context.
+const OFFSCREEN_REASONS = ["AUDIO_PLAYBACK", "BLOBS"];
 const OFFSCREEN_JUSTIFICATION =
-  "Play the short local snap-confirmation cue without creating an AudioContext in the meeting page.";
+  "Play local cues and decode transient camera-frame blobs for local hand inference when page CSP blocks WebAssembly.";
 
 /** Per-tab transient state (engineState / muted). Survives worker suspension. */
 const SESSION_TABS_KEY = "sv_tabs_v2";
-/** Last tab the user actually interacted with (command routing fallback). */
-const SESSION_TARGET_KEY = "sv_target_tab";
 
+// Match the content-script scope, not the broader origin-wide WAR scope.
 function isSupportedMeetingUrl(url) {
-  if (typeof url !== "string" || !url.startsWith("https://")) return false;
+  if (typeof url !== "string") return false;
   try {
     const parsed = new URL(url);
-    return SUPPORTED_HOSTS.some(
-      (h) => parsed.hostname === h || parsed.hostname.endsWith(`.${h}`),
-    );
+    if (parsed.protocol !== "https:") return false;
+    if (["meet.google.com", "teams.microsoft.com", "teams.live.com"].includes(parsed.hostname)) return true;
+    return (parsed.hostname === "zoom.us" || parsed.hostname.endsWith(".zoom.us")) && parsed.pathname.startsWith("/wc/");
   } catch {
     return false;
   }
@@ -243,16 +287,10 @@ function isSupportedMeetingUrl(url) {
  * ------------------------------------------------------------------ */
 
 async function readPrefs() {
-  try {
-    const stored = await chrome.storage.sync.get(null);
-    const nested = stored?.snap_vanish_settings_v2;
-    return {
-      ...DEFAULT_SYNC_PREFS,
-      ...(nested && typeof nested === "object" ? nested : stored ?? {}),
-    };
-  } catch {
-    return { ...DEFAULT_SYNC_PREFS };
-  }
+  const stored = await chrome.storage.sync.get(null);
+  const nested = stored?.[SETTINGS_KEY];
+  const source = nested && typeof nested === "object" && !Array.isArray(nested) ? nested : stored;
+  return mergeSettings(DEFAULT_SYNC_PREFS, sanitizeSettingsPatch(source));
 }
 
 async function readSessionTabs() {
@@ -312,14 +350,19 @@ async function setBadge(kind) {
 
 /** Derives the badge purely from persisted state — never from a global. */
 async function syncBadge() {
-  const prefs = await readPrefs();
-  if (prefs.enabled === false) {
-    await setBadge("off");
-    return;
+  try {
+    const prefs = await readPrefs();
+    if (prefs.enabled === false) {
+      await setBadge("off");
+      return;
+    }
+    // The session cache can outlive a content script. Do not present its last
+    // state as a live claim about any meeting's outgoing stream.
+    await setBadge("on");
+  } catch {
+    // Do not claim an enabled state when durable preferences cannot be read.
+    try { await chrome.action.setBadgeText({ text: "?" }); } catch { /* unavailable */ }
   }
-  const tabs = await readSessionTabs();
-  const vanished = Object.values(tabs).some((t) => t?.engineState === "vanished");
-  await setBadge(vanished ? "gone" : "on");
 }
 
 /* ------------------------------------------------------------------ *
@@ -328,57 +371,35 @@ async function syncBadge() {
 
 async function listMeetingTabs() {
   try {
-    return await chrome.tabs.query({ url: MEETING_PATTERNS });
+    return (await chrome.tabs.query({ url: MEETING_PATTERNS })).filter((tab) => isSupportedMeetingUrl(tab.url));
   } catch {
     return [];
   }
 }
 
-/**
- * Resolves the tab a command should be delivered to.
- * Preference order: explicit tab → last interacted meeting tab → active tab →
- * first meeting tab in any window. All of it is re-derived per invocation, so a
- * suspended-then-revived worker still targets the right tab.
- */
+/** Never send a camera/microphone command to an arbitrary background meeting. */
 async function resolveTargetTab(preferredTabId) {
   if (typeof preferredTabId === "number") {
     try {
       const tab = await chrome.tabs.get(preferredTabId);
-      if (tab && isSupportedMeetingUrl(tab.url)) return tab;
-    } catch {
-      /* tab gone */
-    }
+      if (tab && isSupportedMeetingUrl(tab.url)) return { tab };
+    } catch { /* tab gone */ }
+    return { tab: null, reason: "invalid-target-tab" };
   }
 
   const meetingTabs = await listMeetingTabs();
-  if (meetingTabs.length === 0) return null;
-
-  try {
-    const session = await chrome.storage.session.get(SESSION_TARGET_KEY);
-    const remembered = session?.[SESSION_TARGET_KEY];
-    const hit = meetingTabs.find((t) => t.id === remembered);
-    if (hit) return hit;
-  } catch {
-    /* noop */
-  }
-
+  if (meetingTabs.length === 0) return { tab: null, reason: "no-supported-meeting-tab" };
   try {
     const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-    const activeHit = meetingTabs.find((t) => t.id === active?.id);
-    if (activeHit) return activeHit;
-  } catch {
-    /* noop */
-  }
-
-  return meetingTabs[0] ?? null;
+    const activeHit = meetingTabs.find((tab) => tab.id === active?.id);
+    if (activeHit) return { tab: activeHit };
+  } catch { /* try the unambiguous single-tab case */ }
+  if (meetingTabs.length === 1) return { tab: meetingTabs[0] };
+  return { tab: null, reason: "multiple-meeting-tabs" };
 }
 
-async function rememberTargetTab(tabId) {
-  try {
-    await chrome.storage.session.set({ [SESSION_TARGET_KEY]: tabId });
-  } catch {
-    /* noop */
-  }
+function sourceMeetingTabId(sender) {
+  return isSupportedMeetingUrl(sender?.tab?.url) ? sender.tab.id : undefined;
 }
 
 /**
@@ -404,8 +425,10 @@ async function sendToTab(tabId, message) {
         await syncBadge();
       }
     }
-    return res ?? { ok: true };
+    return res ?? { ok: false, reason: "empty-response" };
   } catch (err) {
+    lastWrittenState.delete(tabId);
+    await forgetSessionTab(tabId);
     return {
       ok: false,
       reason: "content-script-unreachable",
@@ -415,16 +438,12 @@ async function sendToTab(tabId, message) {
 }
 
 async function sendToTarget(message, preferredTabId) {
-  const tab = await resolveTargetTab(preferredTabId);
+  const { tab, reason } = await resolveTargetTab(preferredTabId);
   if (!tab || typeof tab.id !== "number") {
-    return {
-      ok: false,
-      reason: "no-supported-meeting-tab",
-      interceptionMode: "inactive",
-    };
+    return { ok: false, reason: reason || "no-supported-meeting-tab", interceptionMode: "inactive" };
   }
-  await rememberTargetTab(tab.id);
-  return sendToTab(tab.id, message);
+  const response = await sendToTab(tab.id, message);
+  return { ...response, tabId: tab.id };
 }
 
 /** Broadcast used by safety-critical operations (settings + emergency restore). */
@@ -435,15 +454,64 @@ async function broadcastToMeetingTabs(message, exceptTabId) {
       .filter((t) => typeof t.id === "number" && t.id !== exceptTabId)
       .map((t) => sendToTab(t.id, message)),
   );
+  const delivered = results.filter((result) => result?.ok === true).length;
   return {
-    ok: results.some((r) => r && r.ok !== false),
-    delivered: results.filter((r) => r && r.ok !== false).length,
+    ok: results.length > 0 && delivered === results.length,
+    delivered,
     attempted: results.length,
   };
 }
 
+// This in-memory queue coordinates concurrent events only; the canonical value
+// is always read from storage at commit time, including after a worker restart.
+const settingsWrites = { chain: Promise.resolve(), pending: null };
+
+function writeSettings(update) {
+  const operation = settingsWrites.chain.then(async () => {
+    const current = await readPrefs();
+    const patch = sanitizeSettingsPatch(typeof update === "function" ? update(current) : update);
+    const merged = mergeSettings(current, patch);
+    await chrome.storage.sync.set({ [SETTINGS_KEY]: merged });
+    const broadcast = await broadcastToMeetingTabs({ type: "SETTINGS_CHANGED", payload: merged });
+    await syncBadge();
+    return { ok: true, settings: merged, forwarded: broadcast.delivered };
+  });
+  settingsWrites.chain = operation.catch(() => {});
+  return operation;
+}
+
+function flushPendingSettings() {
+  const batch = settingsWrites.pending;
+  if (!batch) return settingsWrites.chain;
+  settingsWrites.pending = null;
+  clearTimeout(batch.timer);
+  clearTimeout(batch.maxTimer);
+  const operation = writeSettings(batch.patch);
+  operation.then(
+    (result) => batch.waiters.forEach(({ resolve }) => resolve(result)),
+    (error) => batch.waiters.forEach(({ reject }) => reject(error)),
+  );
+  return operation;
+}
+
+function queueSettingsPatch(patch) {
+  return new Promise((resolve, reject) => {
+    let batch = settingsWrites.pending;
+    if (!batch) {
+      batch = { patch: {}, waiters: [], timer: null, maxTimer: null };
+      settingsWrites.pending = batch;
+      // Bound latency even during a long drag; ordinary slider bursts become one write.
+      batch.maxTimer = setTimeout(() => { void flushPendingSettings().catch(() => {}); }, 1000);
+    }
+    batch.patch = mergeSettings(batch.patch, patch);
+    batch.waiters.push({ resolve, reject });
+    clearTimeout(batch.timer);
+    batch.timer = setTimeout(() => { void flushPendingSettings().catch(() => {}); }, 300);
+  });
+}
+
 /* ------------------------------------------------------------------ *
- * Offscreen document (extension-origin DOM for audio playback)
+ * Offscreen document (extension-origin audio and CSP-safe local inference)
  * ------------------------------------------------------------------ */
 
 let offscreenCreating = null;
@@ -490,17 +558,26 @@ async function ensureOffscreenDocument() {
   }
 }
 
+async function releaseOffscreenModelForTab(tabId) {
+  try {
+    if (await hasOffscreenDocument()) {
+      await chrome.runtime.sendMessage({ type: "OFFSCREEN_HAND_RELEASE", payload: { tabId } });
+    }
+  } catch { /* document may already be gone */ }
+}
+
 /* ------------------------------------------------------------------ *
  * Lifecycle
  * ------------------------------------------------------------------ */
 
 chrome.runtime.onInstalled.addListener(async (details) => {
-  // Merge instead of overwrite: never clobber a returning user's settings.
+  // Migrate once. An existing canonical document wins over legacy flat mirrors;
+  // without it, preserve valid legacy fields rather than resetting preferences.
   const existing = await chrome.storage.sync.get(null);
-  const hasUserPrefs =
-    existing && Object.keys(existing).length > 0 && existing.enabled !== undefined;
-  if (!hasUserPrefs) {
-    await chrome.storage.sync.set(DEFAULT_SYNC_PREFS);
+  const canonical = existing?.[SETTINGS_KEY];
+  if (!canonical || typeof canonical !== "object" || Array.isArray(canonical)) {
+    const migrated = mergeSettings(DEFAULT_SYNC_PREFS, sanitizeSettingsPatch(existing));
+    await chrome.storage.sync.set({ [SETTINGS_KEY]: migrated });
   }
   await syncBadge();
   if (details.reason === "install") {
@@ -523,6 +600,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  lastWrittenState.delete(tabId);
+  void releaseOffscreenModelForTab(tabId);
   void (async () => {
     await forgetSessionTab(tabId);
     await syncBadge();
@@ -530,8 +609,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "loading") void releaseOffscreenModelForTab(tabId);
   if (typeof changeInfo.url !== "string") return;
   if (!isSupportedMeetingUrl(changeInfo.url)) {
+    lastWrittenState.delete(tabId);
+    void releaseOffscreenModelForTab(tabId);
     void forgetSessionTab(tabId);
   }
 });
@@ -539,14 +621,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 chrome.commands.onCommand.addListener((command) => {
   void (async () => {
     if (command === "toggle-snap") {
-      const prefs = await readPrefs();
-      const next = prefs.enabled === false;
-      await chrome.storage.sync.set({ enabled: next });
-      await broadcastToMeetingTabs({
-        type: "SETTINGS_CHANGED",
-        payload: { enabled: next },
-      });
-      await syncBadge();
+      // Respect earlier UI edits and compute the toggle inside the serialized
+      // write, so rapid repeated commands cannot reuse a stale value.
+      await flushPendingSettings();
+      await writeSettings((prefs) => ({ enabled: prefs.enabled === false }));
       return;
     }
     if (command === "vanish-now") {
@@ -562,45 +640,58 @@ chrome.commands.onCommand.addListener((command) => {
       await broadcastToMeetingTabs({ type: "EMERGENCY_RESTORE" });
       await syncBadge();
     }
-  })();
+  })().catch((error) => {
+    console.warn("[snap-vanish] command failed:", error instanceof Error ? error.message : String(error));
+  });
 });
 
 /* ------------------------------------------------------------------ *
  * Message router
  * ------------------------------------------------------------------ */
 
-const handlers = {
-  async PING(msg, sender) {
-    if (sender.tab?.id !== undefined) {
-      const state = await sendToTab(sender.tab.id, { type: "PING" });
-      return state;
+async function forwardHandModel(type, msg, sender) {
+  const tabId = sourceMeetingTabId(sender);
+  if (typeof tabId !== "number" || (sender.frameId !== undefined && sender.frameId !== 0)) {
+    return { ok: false, reason: "unexpected-sender" };
+  }
+  if (type === "OFFSCREEN_HAND_RELEASE") {
+    await releaseOffscreenModelForTab(tabId);
+    return { ok: true };
+  }
+  const payload = { tabId };
+  if (type === "OFFSCREEN_HAND_START") {
+    const confidence = msg.payload?.minConfidence;
+    payload.minConfidence = typeof confidence === "number" && Number.isFinite(confidence) ? Math.max(0.3, Math.min(0.95, confidence)) : 0.62;
+    if (!(await ensureOffscreenDocument())) return { ok: false, reason: "offscreen-unavailable" };
+  } else {
+    const frame = msg.payload?.frame;
+    if (typeof frame !== "string" || frame.length > 250000 || !frame.startsWith("data:image/jpeg;base64,")) {
+      return { ok: false, reason: "invalid-frame" };
     }
-    return sendToTarget({ type: "PING" });
+    if (!(await hasOffscreenDocument())) return { ok: false, reason: "offscreen-unavailable" };
+    payload.frame = frame;
+    payload.timestamp = typeof msg.payload?.timestamp === "number" && Number.isFinite(msg.payload.timestamp) ? msg.payload.timestamp : 0;
+  }
+  try {
+    return await chrome.runtime.sendMessage({ type, payload }) ?? { ok: false, reason: "offscreen-unavailable" };
+  } catch {
+    return { ok: false, reason: "offscreen-unavailable" };
+  }
+}
+
+const handlers = {
+  HAND_MODEL_START: (msg, sender) => forwardHandModel("OFFSCREEN_HAND_START", msg, sender),
+  HAND_MODEL_INFER: (msg, sender) => forwardHandModel("OFFSCREEN_HAND_INFER", msg, sender),
+  HAND_MODEL_RELEASE: (msg, sender) => forwardHandModel("OFFSCREEN_HAND_RELEASE", msg, sender),
+
+  async PING(_msg, sender) {
+    return sendToTarget({ type: "PING" }, sourceMeetingTabId(sender));
   },
 
   async GET_STATE(_msg, sender) {
-    if (sender.tab?.id !== undefined) {
-      return sendToTab(sender.tab.id, { type: "GET_STATE" });
-    }
-    const res = await sendToTarget({ type: "GET_STATE" });
-    if (res?.ok === false) {
-      // Fall back to the cached snapshot so the popup still shows something
-      // truthful ("vanished on a background tab") instead of a blank state.
-      const tabs = await readSessionTabs();
-      const cached = Object.entries(tabs).find(
-        ([, v]) => typeof v?.engineState === "string",
-      );
-      if (cached) {
-        return {
-          ok: true,
-          cached: true,
-          tabId: Number(cached[0]),
-          engineState: cached[1].engineState,
-          interceptionMode: cached[1].interceptionMode ?? "unknown",
-        };
-      }
-    }
-    return res;
+    // Never promote a cached snapshot to a live response. A closed/reloaded
+    // content script is unknown, even if a previous tab reported a state.
+    return sendToTarget({ type: "GET_STATE" }, sourceMeetingTabId(sender));
   },
 
   async OPEN_STUDIO() {
@@ -615,32 +706,14 @@ const handlers = {
     return { ok: true };
   },
 
-  async SETTINGS_CHANGED(msg, sender) {
-    // Untrusted input: allowlist + clamp before anything reaches storage.
-    const payload = sanitizeSettingsPatch(msg.payload);
-    const current = await readPrefs();
-    const merged = {
-      ...current,
-      ...payload,
-      gesture: { ...(current.gesture ?? {}), ...(payload.gesture ?? {}) },
-      audio: { ...(current.audio ?? {}), ...(payload.audio ?? {}) },
-      camera: { ...(current.camera ?? {}), ...(payload.camera ?? {}) },
-    };
-    // Flat mirrors keep the popup / content-script / studio readers in sync
-    // without each having to understand the nested schema.
-    await chrome.storage.sync.set({
-      ...DEFAULT_SYNC_PREFS,
-      ...merged,
-      enabled: merged.enabled !== false,
-      snap_vanish_settings_v2: merged,
-    });
-    const broadcast = await broadcastToMeetingTabs(
-      { type: "SETTINGS_CHANGED", payload: merged },
-      // The sender's own tab already applied the change locally.
-      sender.tab?.id,
-    );
-    await syncBadge();
-    return { ok: true, forwarded: broadcast.delivered };
+  async SETTINGS_CHANGED(msg) {
+    // All surfaces send patches through this single, serialized writer.
+    return queueSettingsPatch(sanitizeSettingsPatch(msg.payload));
+  },
+
+  async DETECTION_TOGGLE() {
+    await flushPendingSettings();
+    return writeSettings((prefs) => ({ gesture: { enabled: prefs.gesture?.enabled === false } }));
   },
 
   async PLAY_CUE(msg) {
@@ -666,18 +739,18 @@ const handlers = {
     // Only the offscreen document (an extension context, no tab) may post these.
     if (sender.tab) return { ok: false, reason: "unexpected-sender" };
     const payload = msg.payload && typeof msg.payload === "object" ? msg.payload : {};
-    const tab = await resolveTargetTab(payload.tabId);
+    const { tab } = await resolveTargetTab(payload.tabId);
     if (tab?.id !== undefined) {
-      await sendToTab(tab.id, { type: "OFFSCREEN_EVENT", payload });
+      return sendToTab(tab.id, { type: "OFFSCREEN_EVENT", payload });
     }
-    return { ok: true };
+    return { ok: false, reason: "no-target-tab" };
   },
 
   async EMERGENCY_RESTORE(_msg, sender) {
     // Always fan out: a stranded vanished tab is the worst possible outcome.
     const res = await broadcastToMeetingTabs({ type: "EMERGENCY_RESTORE" });
     await syncBadge();
-    return { ok: true, engineState: "live", ...res, from: sender?.tab?.id ?? null };
+    return { ...res, reason: res.ok ? undefined : res.attempted ? "restore-incomplete" : "no-supported-meeting-tab", from: sender?.tab?.id ?? null };
   },
 
   async RESET_FRAME(_msg, sender) {
@@ -693,6 +766,9 @@ const FORWARD_TO_TAB = new Set([
   "MUTE_TOGGLE",
   "DETECTION_TOGGLE",
   "CAPTURE_CLEAN_PLATE",
+  "REVIEW_CLEAN_PLATE",
+  "CANCEL_CLEAN_PLATE",
+  "CLEAR_CLEAN_PLATE",
   "CALIBRATE_GESTURE",
   "RUN_DIAGNOSTICS",
   "STATE",
@@ -727,7 +803,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const work = special
     ? special(msg, sender)
     : FORWARD_TO_TAB.has(msg.type)
-      ? sendToTarget(msg, sender.tab?.id)
+      ? sendToTarget(msg, sourceMeetingTabId(sender))
       : Promise.resolve({ ok: false, reason: "no-handler" });
 
   work

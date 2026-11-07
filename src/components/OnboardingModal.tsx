@@ -35,10 +35,10 @@ interface OnboardingStepDef {
 const STEPS: OnboardingStepDef[] = [
   {
     badge: "STEP 1 OF 8 · WELCOME & PRIVACY",
-    title: "Disintegrate out of any call — 100% locally.",
-    body: "Snap Vanish 2.0 runs MediaPipe 21-point hand landmark inference, acoustic transient confirmation, and particle physics strictly inside your browser's local memory.",
+    title: "Local effects, with clear meeting limits.",
+    body: "Snap Vanish processes hand landmarks, optional audio confirmation, and effects locally using bundled models. If a page blocks WebAssembly, small transient frames are processed in an extension document.",
     detail:
-      "Verified guarantee: Zero video frames, zero audio recordings, and zero telemetry leave your computer. All WASM and TFLite models load directly from bundled extension files.",
+      "Your meeting still sends video and audio to participants. An approved background plate may appear in outgoing video; it stays in tab memory until cleared or the tab is reloaded.",
     icon: ShieldCheck,
   },
   {
@@ -54,9 +54,9 @@ const STEPS: OnboardingStepDef[] = [
   {
     badge: "STEP 3 OF 8 · MICROPHONE CONFIRMATION (OPTIONAL)",
     title: "Prevent accidental triggers with acoustic confirmation.",
-    body: "When enabled, Snap Vanish checks for a short 1.8–4.2 kHz snap transient within 220 ms of finger collapse so talking with your hands never falsely triggers vanish.",
+    body: "When required in Smart mode, Snap Vanish checks for an acoustic transient near a visual snap to help reduce accidental triggers.",
     detail:
-      "Microphone confirmation is optional and can be toggled independently at any time in Settings → Audio. Audio is analyzed in volatile RAM and never recorded.",
+      "If required confirmation is unavailable or denied, automatic detection remains inactive. Choose Gesture mode to opt out or Manual mode to use the controls. Audio is analyzed locally, not recorded by the extension.",
     icon: Mic,
   },
   {
@@ -64,13 +64,13 @@ const STEPS: OnboardingStepDef[] = [
     title: "Frame your snapping hand in front of the lens.",
     body: "Hold your thumb and middle finger 35–65 cm from your webcam. Enable the 21-Pt Landmarks overlay on the viewport to inspect real-time joint tracking and confidence.",
     detail:
-      "If your room lighting dims or your hand leaves the frame, the state machine resets safely without firing.",
+      "Lighting, framing, camera performance, and the fallback frame rate affect accuracy. Use manual controls when detection is unreliable.",
     icon: Hand,
   },
   {
     badge: "STEP 5 OF 8 · GUIDED SNAP CALIBRATION",
     title: "Calibrate to your personal snap speed.",
-    body: "Everyone snaps differently. Our 7-step calibration records 3 natural snaps, measures your collapse distance in palm-normalized millimeters, and recommends Beginner, Balanced, or Precision mode.",
+    body: "Everyone snaps differently. The 7-step calibration samples 3 snap gestures, measures collapse distance in palm-normalized millimeters, and recommends Beginner, Balanced, or Precision mode.",
     detail:
       "You can run or re-run calibration anytime from the Dashboard header or Settings → Detection.",
     icon: Sliders,
@@ -82,17 +82,17 @@ const STEPS: OnboardingStepDef[] = [
     title: "Choose from 6 signature disintegration styles.",
     body: "Switch between Classic Dust, Cinematic Disintegration, Fine Particles, Energy Burst, Gentle Fade, and Reverse Assembly — or craft custom physics in the Personalization Studio.",
     detail:
-      "Particles are pooled in typed arrays and automatically pause when your tab is hidden to protect laptop battery life.",
+      "Particles are pooled in typed arrays. When the pause-when-hidden setting is enabled, non-essential work is suspended while the tab is hidden.",
     icon: Sparkles,
-    actionLabel: "Trigger Live Disintegration Preview",
+    actionLabel: "Trigger Disintegration Preview",
     actionId: "preview",
   },
   {
-    badge: "STEP 7 OF 8 · EMERGENCY RESTORE GUARANTEE",
-    title: "Instant camera recovery is always one key away.",
-    body: "Press Alt+Shift+R or click Emergency Restore in the Dashboard, Popup, or Meeting HUD to unconditionally cancel animations, restore your live camera track, and unmute your mic.",
+    badge: "STEP 7 OF 8 · EMERGENCY RESTORE",
+    title: "Request camera recovery with one key.",
+    body: "Press Alt+Shift+R or click Emergency Restore to cancel animations and attempt to restore the camera. Your microphone state is left unchanged.",
     detail:
-      "Even if WebGL/WASM encounters an error, centralized ErrorService fails open to restore your real camera feed.",
+      "If your original camera track has ended or restoration fails, use the meeting's camera controls or rejoin the call.",
     icon: RotateCcw,
     actionLabel: "Test Emergency Restore Now",
     actionId: "restore",
@@ -100,9 +100,9 @@ const STEPS: OnboardingStepDef[] = [
   {
     badge: "STEP 8 OF 8 · SUPPORTED PLATFORMS & LIMITATIONS",
     title: "Transparent compatibility across conferencing apps.",
-    body: "Google Meet and Microsoft Teams Web use standard WebRTC RTCPeerConnection senders, allowing Snap Vanish's MAIN-world bridge to swap your outgoing video track cleanly via RTCRtpSender.replaceTrack().",
+    body: "The extension attempts outgoing replacement only when it can verify both the camera preview and its WebRTC sender. Meeting-site changes or other media pipelines can prevent it.",
     detail:
-      "Zoom Web Client often uses custom WebAssembly media encoding where WebRTC replaceTrack is unavailable; on Zoom Web, local tile overlay works and OBS Virtual Camera is recommended for outgoing feed replacement.",
+      "A local tile overlay is visible only to you and requires a usable camera preview. Meet, Teams, Zoom, and the optional OBS Virtual Camera workflow have not been verified in live calls; check with another participant before relying on them.",
     icon: Globe,
   },
 ];
@@ -133,10 +133,10 @@ export default function OnboardingModal({
       onOpenCalibration?.();
     } else if (current.actionId === "preview") {
       onTriggerDemoVanish?.();
-      setActionFeedback("Triggered live disintegration transition behind modal.");
+      setActionFeedback("Requested a disintegration preview behind the modal.");
     } else if (current.actionId === "restore") {
       onTriggerEmergencyRestore?.();
-      setActionFeedback("Verified unconditional Emergency Restore.");
+      setActionFeedback("Restore requested. Check the meeting camera; microphone state is unchanged.");
     }
   };
 

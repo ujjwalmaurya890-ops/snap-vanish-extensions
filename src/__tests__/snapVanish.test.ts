@@ -16,6 +16,7 @@ import {
   validateSettings,
 } from "../lib/settings";
 import {
+  resolveBundledAssetUrl,
   sendExtensionMessage,
   validateExtensionMessage,
 } from "../lib/messaging";
@@ -207,6 +208,12 @@ describe("2. Preset Creation, Editing, Duplication, Deletion & Restoration", () 
 describe("3. Extension Message Validation & Service-Worker Restart Handling", () => {
   afterEach(() => {
     delete (globalThis as Record<string, unknown>).chrome;
+  });
+
+  it("resolves standalone model assets against the document, not a nested JS bundle", () => {
+    expect(resolveBundledAssetUrl("wasm/vision_wasm_module_internal.js")).toBe(new URL("wasm/vision_wasm_module_internal.js", document.baseURI).href);
+    (globalThis as Record<string, unknown>).chrome = { runtime: { id: "ext", getURL: (path: string) => `chrome-extension://ext/${path}` } };
+    expect(resolveBundledAssetUrl("/models/hand_landmarker.task")).toBe("chrome-extension://ext/models/hand_landmarker.task");
   });
 
   it("accepts valid messages and rejects malformed or unknown messages", () => {

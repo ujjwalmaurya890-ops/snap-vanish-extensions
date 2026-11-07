@@ -19,9 +19,9 @@
  *    full-frame canvas every frame.
  * 5. Transition state is committed *before* any await, so the first animation
  *    frame is never delayed by the bridge round-trip (up to 600 ms of dead time).
- * 6. Confirmation audio uses one long-lived `AudioContext`; the offscreen document
- *    is used only when the page context is still `suspended` (keyboard-shortcut
- *    path, where no user activation exists).
+ * 6. Confirmation audio uses one long-lived `AudioContext`, with an offscreen
+ *    cue fallback. If page CSP blocks WASM, small transient camera frames are
+ *    processed locally in that extension-origin document for hand inference.
  */
 
 (() => {
@@ -47,7 +47,7 @@
     speed: 1.0,
     particleSize: 1.0,
     density: 80,
-    colorAccent: "#e0532c",
+    colorAccent: "#d2451e",
     intensity: 85,
     motionSmoothness: 70,
     sound: true,
@@ -64,6 +64,7 @@
       cooldownMs: 2000,
       requireAudioConfirm: true,
       calibratedCollapseThresholdMm: 12,
+      actionMapping: "toggle-vanish",
     },
     audio: {
       enabled: true,
@@ -81,12 +82,14 @@
     engineState: "live", // live | vanishing | vanished | restoring
     interceptionMode: "dom-overlay", // webrtc-sender | dom-overlay
     sendersCount: 0,
+    restoreError: null,
+    renderError: null,
     mutedByExtension: false,
     bridgeToken: null,
     busy: false,
     // Initialised here (not only in applySettings) so a vanish before the
     // first storage read can never dereference an undefined accent colour.
-    accentRgb: { r: 224, g: 83, b: 44 },
+    accentRgb: { r: 210, g: 69, b: 30 },
   };
 
   const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
@@ -109,7 +112,8 @@
   const microphoneAllowed = () =>
     detectionActive() &&
     audioConfirmRequired() &&
-    state.cfg.audio?.enabled !== false;
+    state.cfg.audio?.enabled !== false &&
+    !(state.cfg.pauseWhenHidden && document.hidden);
 
   /* ================================================================== *
    * 1. HUD + overlay — closed shadow root, zero host DOM mutation
@@ -136,6 +140,8 @@
       position: fixed;
       display: inline-flex;
       align-items: center;
+      flex-wrap: wrap;
+      max-width: calc(100vw - 32px);
       gap: 8px;
       padding: 6px 10px;
       border-radius: 999px;
@@ -165,15 +171,25 @@
            background: rgba(224, 83, 44, 0.22); color: #ff9d80; border-radius: 999px;
            padding: 4px 8px; font-size: 10.5px; font-weight: 600; cursor: pointer; }
     .btn:hover { background: rgba(240, 98, 58, 0.4); color: #fff; }
+    .btn:focus-visible { outline: 2px solid #ffcc99; outline-offset: 2px; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .btn-restore { background: rgba(239, 68, 68, 0.18);
                    border-color: rgba(239, 68, 68, 0.38); color: #fecaca; }
     .btn-restore:hover { background: rgba(239, 68, 68, 0.34); color: #fff; }
+    #sv-plate-preview { width: 96px; height: 54px; border-radius: 5px; background: #0e1016; }
+    [hidden] { display: none !important; }
   `;
 
   let shadowRoot = null;
   let hudEl = null;
   let hudTextEl = null;
   let hudToggleBtn = null;
+  let hudPlateBtn = null;
+  let hudClearPlateBtn = null;
+  let hudReviewPlateBtn = null;
+  let hudUsePlateBtn = null;
+  let hudHidePreviewBtn = null;
+  let hudPlatePreview = null;
   let tileCanvas = null;
 
   function ensureSurface() {
@@ -190,23 +206,50 @@
 
     tileCanvas = document.createElement("canvas");
     tileCanvas.id = "tile-canvas";
+    try { tileCtx = tileCanvas.getContext("2d", { alpha: false }); } catch { tileCtx = null; }
 
     hudEl = document.createElement("div");
     hudEl.id = "hud";
-    hudEl.setAttribute("role", "status");
+    hudEl.setAttribute("role", "group");
+    hudEl.setAttribute("aria-label", "Snap Vanish meeting controls");
     hudEl.innerHTML =
-      '<span class="dot"></span>' +
-      '<span class="label" id="sv-hud-text">Snap Vanish · Armed</span>' +
+      '<span class="dot" aria-hidden="true"></span>' +
+      '<span class="label" id="sv-hud-text" role="status" aria-live="polite">Snap Vanish · Starting</span>' +
       '<button type="button" class="btn" id="sv-hud-toggle">Vanish</button>' +
       '<button type="button" class="btn btn-restore" id="sv-hud-restore" ' +
-      'title="Emergency Restore (Alt+Shift+R)">Restore</button>';
+      'title="Emergency Restore (Alt+Shift+R)">Restore</button>' +
+      '<button type="button" class="btn" id="sv-hud-plate" title="Capture a background after 5 seconds. Step out of frame; participants may see you. The frame stays in this tab until cleared or reloaded.">Capture plate</button>' +
+      '<button type="button" class="btn" id="sv-hud-clear-plate" hidden>Clear plate</button>' +
+      '<button type="button" class="btn" id="sv-hud-review-plate" hidden>Review plate</button>' +
+      '<button type="button" class="btn" id="sv-hud-use-plate" hidden>Use this plate</button>' +
+      '<button type="button" class="btn" id="sv-hud-hide-preview" hidden>Hide plate preview</button>' +
+      '<canvas id="sv-plate-preview" width="96" height="54" role="img" aria-label="Captured background preview; verify it is empty before using the effect" hidden></canvas>';
 
     shadowRoot.append(style, tileCanvas, hudEl);
     document.documentElement.appendChild(host);
 
     hudTextEl = hudEl.querySelector("#sv-hud-text");
     hudToggleBtn = hudEl.querySelector("#sv-hud-toggle");
+    hudPlateBtn = hudEl.querySelector("#sv-hud-plate");
+    hudClearPlateBtn = hudEl.querySelector("#sv-hud-clear-plate");
+    hudReviewPlateBtn = hudEl.querySelector("#sv-hud-review-plate");
+    hudUsePlateBtn = hudEl.querySelector("#sv-hud-use-plate");
+    hudHidePreviewBtn = hudEl.querySelector("#sv-hud-hide-preview");
+    hudPlatePreview = hudEl.querySelector("#sv-plate-preview");
     hudToggleBtn?.addEventListener("click", () => void startTransition("toggle"));
+    hudPlateBtn?.addEventListener("click", (event) => {
+      if (!event.isTrusted) return;
+      if (plateCaptureDeadline) cancelCleanPlateCapture("cancelled");
+      else beginCleanPlateCapture();
+    });
+    hudClearPlateBtn?.addEventListener("click", (event) => { if (event.isTrusted) clearCleanPlate(); });
+    hudReviewPlateBtn?.addEventListener("click", (event) => { if (event.isTrusted) showCleanPlatePreview(); });
+    hudUsePlateBtn?.addEventListener("click", (event) => { if (event.isTrusted) approveCleanPlate(); });
+    hudHidePreviewBtn?.addEventListener("click", (event) => {
+      if (!event.isTrusted) return;
+      platePreviewVisible = false;
+      updateHud();
+    });
     hudEl
       .querySelector("#sv-hud-restore")
       ?.addEventListener("click", () => void emergencyRestore());
@@ -215,22 +258,39 @@
   function updateHud() {
     if (!hudEl) return;
     hudEl.setAttribute("data-pos", state.cfg.hudPosition || "bottom-right");
-    hudEl.setAttribute("data-hidden", state.cfg.showCallHud === false ? "true" : "false");
+    hudEl.setAttribute("data-hidden", state.cfg.showCallHud === false && !plateCaptureDeadline && !platePreviewVisible ? "true" : "false");
     hudEl.setAttribute("data-state", state.engineState);
     hudEl.setAttribute("data-enabled", String(Boolean(state.cfg.enabled)));
     if (hudTextEl) {
-      if (!state.cfg.enabled) hudTextEl.textContent = "Snap Vanish · Paused";
+      if (state.restoreError) hudTextEl.textContent = "Camera restore failed · check meeting";
+      else if (state.renderError) hudTextEl.textContent = "Effect unavailable · check meeting";
+      else if (plateCaptureDeadline) hudTextEl.textContent = `Step out · capturing in ${Math.max(1, Math.ceil((plateCaptureDeadline - Date.now()) / 1000))}s`;
+      else if (platePreviewVisible) hudTextEl.textContent = "Verify plate is empty, then choose Use";
+      else if (plateCaptureError) hudTextEl.textContent = `Plate capture ${plateCaptureError === "cancelled" ? "cancelled" : "failed"}`;
+      else if (!state.cfg.enabled) hudTextEl.textContent = "Snap Vanish · Paused";
       else if (state.engineState === "vanished")
-        hudTextEl.textContent = `Vanished · ${
-          state.interceptionMode === "webrtc-sender" ? "WebRTC" : "Tile"
-        }`;
+        hudTextEl.textContent = state.interceptionMode === "webrtc-sender"
+          ? "Effect · outgoing camera" : "Effect · local tile only";
       else if (state.engineState === "live")
-        hudTextEl.textContent = `Armed${handModelReady ? " · 21-Pt AI" : ""}`;
+        hudTextEl.textContent = detectionMode() === "manual" ? "Manual mode" : "Snap Vanish · enabled";
       else hudTextEl.textContent = "Transitioning…";
     }
     if (hudToggleBtn) {
+      hudToggleBtn.disabled = !state.cfg.enabled || state.busy || Boolean(plateCaptureDeadline);
       hudToggleBtn.textContent = state.engineState === "vanished" ? "Return" : "Vanish";
     }
+    if (hudPlateBtn) {
+      hudPlateBtn.textContent = plateCaptureDeadline ? "Cancel capture" : "Capture plate";
+      hudPlateBtn.disabled = !plateCaptureDeadline && (!state.cfg.enabled || state.busy || state.engineState !== "live");
+    }
+    if (hudClearPlateBtn) hudClearPlateBtn.hidden = !cleanPlateCanvas;
+    if (hudReviewPlateBtn) hudReviewPlateBtn.hidden = !cleanPlateCanvas || platePreviewVisible;
+    if (hudUsePlateBtn) {
+      hudUsePlateBtn.hidden = !platePreviewVisible;
+      hudUsePlateBtn.disabled = state.engineState !== "live" || state.busy;
+    }
+    if (hudHidePreviewBtn) hudHidePreviewBtn.hidden = !platePreviewVisible;
+    if (hudPlatePreview) hudPlatePreview.hidden = !platePreviewVisible;
   }
 
   /* ================================================================== *
@@ -255,11 +315,33 @@
     );
   }
 
+  // The MAIN-world bridge observes camera acquisition and checks the actual
+  // MediaStream on this element. Labels, muting and mirroring alone are not
+  // proof of self-view: remote meeting videos often share those properties.
+  function isVerifiedCameraVideo(video) {
+    const requestId = `sv-camera-${Math.random().toString(36).slice(2)}`;
+    let verified = false;
+    const receive = (event) => {
+      if (event?.detail?.requestId === requestId) verified = event.detail.ok === true;
+    };
+    window.addEventListener("snap-vanish:bridge-ack", receive);
+    try {
+      video.dispatchEvent(new CustomEvent("snap-vanish:bridge-cmd", {
+        bubbles: true,
+        detail: { requestId, action: "CHECK_CAMERA_PREVIEW" },
+      }));
+    } catch { /* An unavailable bridge is not proof of a local camera. */ }
+    window.removeEventListener("snap-vanish:bridge-ack", receive);
+    return verified;
+  }
+
   function pickSelfVideo() {
-    if (!videoCacheDirty && isUsableVideo(selfVideo)) return selfVideo;
+    if (!videoCacheDirty && isUsableVideo(selfVideo) && isVerifiedCameraVideo(selfVideo)) return selfVideo;
     videoCacheDirty = false;
 
-    const videos = Array.from(document.querySelectorAll("video")).filter(isUsableVideo);
+    const videos = Array.from(document.querySelectorAll("video"))
+      .filter(isUsableVideo)
+      .filter(isVerifiedCameraVideo);
     if (videos.length === 0) {
       selfVideo = null;
       return null;
@@ -325,30 +407,31 @@
   }
 
   function syncOverlayRect() {
-    if (!tileCanvas) return;
+    if (!tileCanvas || !tileCtx) return false;
     const video = pickSelfVideo();
     if (!video) {
       tileCanvas.style.display = "none";
-      return;
+      return false;
     }
     const rect = video.getBoundingClientRect();
     if (rect.width < 32 || rect.height < 32) {
       tileCanvas.style.display = "none";
-      return;
+      return false;
     }
-    // Match the backing store to CSS pixels × DPR, capped at the capture size so
-    // a 4K tile never allocates a 4K canvas.
+    // Apply the size cap after DPR scaling, preserving the tile aspect ratio.
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const cssW = Math.min(rect.width, CAPTURE_MAX_W);
-    const cssH = Math.min(rect.height, CAPTURE_MAX_H);
-    const wantW = Math.round(cssW * dpr);
-    const wantH = Math.round(cssH * dpr);
+    const pixelW = rect.width * dpr;
+    const pixelH = rect.height * dpr;
+    const scale = Math.min(1, CAPTURE_MAX_W / pixelW, CAPTURE_MAX_H / pixelH);
+    const wantW = Math.max(2, Math.round(pixelW * scale));
+    const wantH = Math.max(2, Math.round(pixelH * scale));
     if (tileCanvas.width !== wantW) tileCanvas.width = wantW;
     if (tileCanvas.height !== wantH) tileCanvas.height = wantH;
     tileCanvas.style.left = `${rect.left}px`;
     tileCanvas.style.top = `${rect.top}px`;
     tileCanvas.style.width = `${rect.width}px`;
     tileCanvas.style.height = `${rect.height}px`;
+    return true;
   }
 
   window.addEventListener("resize", scheduleRectSync, { passive: true });
@@ -368,6 +451,168 @@
   let personCtx = null;
   let plateCtx = null;
   let tileCtx = null;
+
+  // A user-requested single frame stays in this isolated tab only. It is never
+  // sent through extension messaging or storage, and is discarded on teardown.
+  let cleanPlateCanvas = null;
+  let cleanPlateSource = null;
+  let cleanPlateApproved = false;
+  let plateCaptureDeadline = 0;
+  let plateCaptureTimer = 0;
+  let plateCaptureVideo = null;
+  let plateCaptureSource = null;
+  let platePreviewVisible = false;
+  let plateCaptureError = null;
+  let plateMethod = "solid-fallback";
+
+  function previewSource(video) {
+    try {
+      const tracks = video?.srcObject?.getVideoTracks?.().filter((track) => track.readyState === "live") || [];
+      if (tracks.length !== 1 || typeof tracks[0].id !== "string" || !tracks[0].id) return null;
+      return { id: tracks[0].id, width: video.videoWidth, height: video.videoHeight };
+    } catch { return null; }
+  }
+
+  function samePreviewSource(a, b) {
+    return Boolean(a && b && a.id === b.id && a.width === b.width && a.height === b.height);
+  }
+
+  function cancelCleanPlateCapture(reason = "cancelled") {
+    if (plateCaptureTimer) window.clearTimeout(plateCaptureTimer);
+    plateCaptureTimer = 0;
+    plateCaptureDeadline = 0;
+    plateCaptureVideo = null;
+    plateCaptureSource = null;
+    plateCaptureError = reason;
+    updateHud();
+    return { ok: true };
+  }
+
+  function clearCleanPlate() {
+    if (plateCaptureDeadline) cancelCleanPlateCapture();
+    const hadPlate = Boolean(cleanPlateCanvas);
+    if (cleanPlateCanvas) { cleanPlateCanvas.width = 0; cleanPlateCanvas.height = 0; }
+    cleanPlateCanvas = null;
+    cleanPlateSource = null;
+    cleanPlateApproved = false;
+    platePreviewVisible = false;
+    plateCaptureError = null;
+    plateMethod = "solid-fallback";
+    if (plateCanvas && plateCtx) {
+      plateCtx.filter = "none";
+      plateCtx.fillStyle = "#0e1016";
+      plateCtx.fillRect(0, 0, plateCanvas.width, plateCanvas.height);
+    }
+    // The capture canvas is page-visible for the bridge; erase its last plate
+    // immediately too, including while a processed sender is still attached.
+    if (captureCanvas && captureCtx) {
+      try {
+        captureCtx.save();
+        captureCtx.setTransform(1, 0, 0, 1, 0, 0);
+        captureCtx.globalAlpha = 1;
+        captureCtx.fillStyle = "#0e1016";
+        captureCtx.fillRect(0, 0, captureCanvas.width, captureCanvas.height);
+        captureCtx.restore();
+      } catch { /* context lost */ }
+    }
+    if (hadPlate) {
+      try { hudPlatePreview?.getContext("2d")?.clearRect(0, 0, 96, 54); } catch { /* unavailable */ }
+    }
+    updateHud();
+    return { ok: true };
+  }
+
+  function validCleanPlate(video) {
+    if (!cleanPlateCanvas) return false;
+    if (samePreviewSource(cleanPlateSource, previewSource(video))) return true;
+    clearCleanPlate();
+    plateCaptureError = "camera-changed";
+    updateHud();
+    return false;
+  }
+
+  function matchingCleanPlate(video) {
+    return validCleanPlate(video) && cleanPlateApproved;
+  }
+
+  function showCleanPlatePreview() {
+    if (!validCleanPlate(pickSelfVideo())) return { ok: false, reason: "no-captured-plate" };
+    platePreviewVisible = true;
+    updateHud();
+    return { ok: true };
+  }
+
+  // Only the explicit HUD confirmation calls this; until then rendering uses the
+  // neutral fallback even if a frame was captured successfully.
+  function approveCleanPlate() {
+    if (state.engineState !== "live" || state.busy) return { ok: false, reason: "camera-not-live" };
+    if (!validCleanPlate(pickSelfVideo())) return { ok: false, reason: "no-captured-plate" };
+    cleanPlateApproved = true;
+    platePreviewVisible = false;
+    plateCaptureError = null;
+    updateHud();
+    return { ok: true };
+  }
+
+  function capturePlateTick() {
+    plateCaptureTimer = 0;
+    const video = plateCaptureVideo;
+    if (!plateCaptureDeadline) return;
+    if (document.hidden || !state.cfg.enabled || state.busy || state.engineState !== "live" ||
+        pickSelfVideo() !== video || !samePreviewSource(plateCaptureSource, previewSource(video))) {
+      cancelCleanPlateCapture("capture-interrupted");
+      return;
+    }
+    if (Date.now() < plateCaptureDeadline) {
+      updateHud();
+      plateCaptureTimer = window.setTimeout(capturePlateTick, Math.min(1000, plateCaptureDeadline - Date.now()));
+      return;
+    }
+    try {
+      const size = captureSizeFor(video);
+      const canvas = document.createElement("canvas");
+      canvas.width = size.w;
+      canvas.height = size.h;
+      const ctx = canvas.getContext("2d", { alpha: false });
+      const preview = hudPlatePreview?.getContext("2d");
+      if (!ctx || !preview) throw new Error("canvas-unavailable");
+      ctx.drawImage(video, 0, 0, size.w, size.h);
+      // Confirm the frame is origin-clean before calling the capture successful.
+      ctx.getImageData(0, 0, 1, 1);
+      preview.clearRect(0, 0, 96, 54);
+      preview.drawImage(canvas, 0, 0, 96, 54);
+      if (cleanPlateCanvas) { cleanPlateCanvas.width = 0; cleanPlateCanvas.height = 0; }
+      cleanPlateCanvas = canvas;
+      cleanPlateSource = plateCaptureSource;
+      cleanPlateApproved = false;
+      plateCaptureDeadline = 0;
+      plateCaptureVideo = null;
+      plateCaptureSource = null;
+      plateCaptureError = null;
+      platePreviewVisible = true;
+      updateHud();
+    } catch {
+      cancelCleanPlateCapture("capture-failed");
+    }
+  }
+
+  function beginCleanPlateCapture() {
+    if (plateCaptureDeadline) return { ok: false, reason: "capture-pending" };
+    if (!state.cfg.enabled || state.busy || state.engineState !== "live" || state.restoreError)
+      return { ok: false, reason: "camera-not-live" };
+    if (document.hidden) return { ok: false, reason: "focus-meeting-tab" };
+    const video = pickSelfVideo();
+    const source = previewSource(video);
+    if (!video || !source) return { ok: false, reason: "no-verified-camera-preview" };
+    plateCaptureVideo = video;
+    plateCaptureSource = source;
+    plateCaptureError = null;
+    platePreviewVisible = false;
+    plateCaptureDeadline = Date.now() + 5000;
+    updateHud();
+    plateCaptureTimer = window.setTimeout(capturePlateTick, 1000);
+    return { ok: true, cleanPlateStatus: "countdown", cleanPlateRemaining: 5 };
+  }
 
   const particles = {
     count: 0,
@@ -433,13 +678,12 @@
       if (!captureCanvas.parentElement) {
         document.documentElement.appendChild(captureCanvas);
       }
-      captureCtx = captureCanvas.getContext("2d", { alpha: false, desynchronized: true });
+      try { captureCtx = captureCanvas.getContext("2d", { alpha: false, desynchronized: true }); } catch { captureCtx = null; }
     }
     // Only resize while detached from the peer connection: changing the backing
     // store of a captured canvas forces an SDP renegotiation on the call.
     if (state.interceptionMode !== "webrtc-sender") {
-      captureCanvas.width = width;
-      captureCanvas.height = height;
+      ensureCanvasSize(captureCanvas, width, height);
     }
     return captureCanvas;
   }
@@ -465,17 +709,15 @@
     }
     ensureCanvasSize(plateCanvas, w, h);
     plateCtx.clearRect(0, 0, w, h);
-    if (video) {
-      // Extrapolate peripheral room strips into a clean ambient background plate.
-      plateCtx.filter = "blur(22px) brightness(0.94)";
-      plateCtx.drawImage(video, 0, 0, w, h);
-      plateCtx.filter = "none";
-      const borderW = Math.floor(w * 0.16);
-      plateCtx.drawImage(video, 0, 0, borderW, h, 0, 0, borderW, h);
-      plateCtx.drawImage(video, w - borderW, 0, borderW, h, w - borderW, 0, borderW, h);
+    if (video && matchingCleanPlate(video)) {
+      plateCtx.drawImage(cleanPlateCanvas, 0, 0, w, h);
+      plateMethod = "captured-plate";
     } else {
+      // A blurred current frame can still reveal a person. Use a neutral solid
+      // backdrop unless the user explicitly captured and reviewed a plate.
       plateCtx.fillStyle = "#0e1016";
       plateCtx.fillRect(0, 0, w, h);
+      plateMethod = "solid-fallback";
     }
 
     const img = personCtx.getImageData(0, 0, w, h).data;
@@ -584,10 +826,10 @@
    * 4. Renderer
    * ================================================================== */
 
-  function renderFrame(t) {
-    const target = state.interceptionMode === "webrtc-sender" ? captureCtx : tileCtx;
-    const canvas = state.interceptionMode === "webrtc-sender" ? captureCanvas : tileCanvas;
-    if (!target || !canvas || !plateCanvas) return;
+  function renderFrame(t, mode = state.interceptionMode) {
+    const target = mode === "webrtc-sender" ? captureCtx : tileCtx;
+    const canvas = mode === "webrtc-sender" ? captureCanvas : tileCanvas;
+    if (!target || !canvas || !plateCanvas || !personCanvas) return false;
 
     try {
       const sx = canvas.width / frame.w;
@@ -608,8 +850,10 @@
         }
         emitParticles(target, t);
       }
+      return true;
     } catch {
       // A single bad frame must never break the session; the next rAF retries.
+      return false;
     }
   }
 
@@ -730,6 +974,19 @@
     );
   }
 
+  function renderTick(progress) {
+    const ok = renderFrame(progress);
+    const error = state.interceptionMode === "webrtc-sender" ? "capture-render-failed" : "overlay-render-failed";
+    if (!ok && state.renderError !== error) {
+      state.renderError = error;
+      updateHud();
+    } else if (ok && (state.renderError === "capture-render-failed" || state.renderError === "overlay-render-failed")) {
+      state.renderError = null;
+      updateHud();
+    }
+    return ok;
+  }
+
   function tick(now) {
     rafId = 0;
     if (state.cfg.pauseWhenHidden && document.hidden) {
@@ -740,7 +997,7 @@
     if (state.engineState === "vanishing" || state.engineState === "restoring") {
       const k = clamp((now - animStartMs) / totalDurationMs(), 0, 1);
       const t = animFrom + (animTo - animFrom) * k;
-      renderFrame(t);
+      renderTick(t);
       if (k < 1) {
         rafId = requestAnimationFrame(tick);
         return;
@@ -755,7 +1012,7 @@
     if (state.engineState === "vanished") {
       if (now - lastKeepAliveAt >= KEEPALIVE_INTERVAL_MS) {
         lastKeepAliveAt = now;
-        renderFrame(1);
+        renderTick(1);
       }
       rafId = requestAnimationFrame(tick);
     }
@@ -781,7 +1038,7 @@
     entry.resolve(d);
   });
 
-  function bridgeRequest(action, extra = {}, timeoutMs = BRIDGE_TIMEOUT_MS) {
+  function bridgeRequest(action, extra = {}, timeoutMs = BRIDGE_TIMEOUT_MS, target = window) {
     return new Promise((resolve) => {
       const requestId = `sv-${++bridgeSeq}-${(Math.random() * 1e6) | 0}`;
       const timer = window.setTimeout(() => {
@@ -790,8 +1047,9 @@
       }, timeoutMs);
       bridgePending.set(requestId, { resolve, timer });
       try {
-        window.dispatchEvent(
+        target.dispatchEvent(
           new CustomEvent("snap-vanish:bridge-cmd", {
+            bubbles: true,
             detail: {
               requestId,
               action,
@@ -808,24 +1066,21 @@
     });
   }
 
-  async function handshakeBridge() {
-    const hello = await bridgeRequest("HELLO", {}, BRIDGE_TIMEOUT_MS);
+  async function handshakeBridge(video = null) {
+    const hello = await bridgeRequest("HELLO", {}, BRIDGE_TIMEOUT_MS, video || window);
     if (!hello || !hello.ok) return null;
     state.bridgeToken = hello.token;
-    state.sendersCount = hello.sendersCount || 0;
-    state.interceptionMode = hello.sendersCount > 0 ? "webrtc-sender" : "dom-overlay";
+    state.sendersCount = hello.sendersCount ?? 0;
     return hello;
   }
 
   function captureSizeFor(video, videoSettings) {
-    const w = Math.min(
-      CAPTURE_MAX_W,
-      Math.round(videoSettings?.width || video?.videoWidth || 640),
-    );
-    const h = Math.min(
-      CAPTURE_MAX_H,
-      Math.round(videoSettings?.height || video?.videoHeight || 360),
-    );
+    const dimension = (preferred, fallback) => Number.isFinite(preferred) && preferred > 0 ? preferred : fallback;
+    const sourceW = dimension(videoSettings?.width, dimension(video?.videoWidth, 640));
+    const sourceH = dimension(videoSettings?.height, dimension(video?.videoHeight, 360));
+    const scale = Math.min(1, CAPTURE_MAX_W / sourceW, CAPTURE_MAX_H / sourceH);
+    const w = Math.max(2, Math.floor(sourceW * scale));
+    const h = Math.max(2, Math.floor(sourceH * scale));
     // Even dimensions keep every encoder happy.
     return { w: Math.max(2, w - (w % 2)), h: Math.max(2, h - (h % 2)) };
   }
@@ -838,6 +1093,12 @@
   let audioAnalyser = null;
   let audioBuf = null;
   let micStream = null;
+  let audioSource = null;
+  let audioFilter = null;
+  let audioStartPromise = null;
+  let audioGeneration = 0;
+  let audioStartFailed = false;
+  let audioGateError = null;
   let audioFloorDb = -60;
   let lastOnsetAt = null;
 
@@ -886,40 +1147,88 @@
     }
   }
 
-  async function ensureAudioGate() {
-    if (audioAnalyser) return true;
-    // The microphone is opened only in Smart mode with confirmation enabled.
-    if (!microphoneAllowed()) return false;
-    if (!navigator.mediaDevices?.getUserMedia) return false;
-    try {
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        },
-        video: false,
-      });
-      const ctx = ensureAudioContext();
-      if (!ctx) return false;
-      const src = ctx.createMediaStreamSource(micStream);
-      const bp = ctx.createBiquadFilter();
-      bp.type = "bandpass";
-      bp.frequency.value = 2800;
-      bp.Q.value = 1.2;
-      audioAnalyser = ctx.createAnalyser();
-      audioAnalyser.fftSize = 512;
-      audioBuf = new Float32Array(audioAnalyser.fftSize);
-      src.connect(bp).connect(audioAnalyser);
-      return true;
-    } catch {
-      audioAnalyser = null;
-      return false;
+  function stopStream(stream) {
+    let tracks = [];
+    try { tracks = stream?.getTracks() ?? []; } catch { return; }
+    for (const track of tracks) {
+      try { if (track.readyState !== "ended") track.stop(); } catch { /* keep stopping the others */ }
     }
   }
 
+  async function ensureAudioGate() {
+    if (audioAnalyser && audioCtx?.state === "running") return true;
+    if (!microphoneAllowed() || tornDown || audioStartFailed) return false;
+    if (audioStartPromise) return audioStartPromise;
+    if (!navigator.mediaDevices?.getUserMedia) {
+      audioGateError = "microphone-unavailable";
+      audioStartFailed = true;
+      return false;
+    }
+
+    const requestedGeneration = audioGeneration;
+    const start = (async () => {
+      let stream = null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+          video: false,
+        });
+        if (requestedGeneration !== audioGeneration || !microphoneAllowed() || tornDown) {
+          stopStream(stream);
+          return false;
+        }
+        const ctx = ensureAudioContext();
+        if (!ctx) throw new Error("audio-context-unavailable");
+        // Publish ownership before awaiting resume so pause/teardown can stop it.
+        micStream = stream;
+        if (ctx.state === "suspended") await ctx.resume();
+        if (requestedGeneration !== audioGeneration || !microphoneAllowed() || tornDown) {
+          stopStream(stream);
+          return false;
+        }
+        if (ctx.state !== "running") throw new Error("audio-context-not-running");
+        const source = ctx.createMediaStreamSource(stream);
+        const filter = ctx.createBiquadFilter();
+        filter.type = "bandpass";
+        filter.frequency.value = 2800;
+        filter.Q.value = 1.2;
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(filter).connect(analyser);
+        audioSource = source;
+        audioFilter = filter;
+        audioAnalyser = analyser;
+        audioBuf = new Float32Array(analyser.fftSize);
+        audioGateError = null;
+        for (const track of stream.getAudioTracks()) {
+          track.addEventListener("ended", () => {
+            if (micStream !== stream) return;
+            releaseAudio();
+            audioStartFailed = true;
+            audioGateError = "microphone-ended";
+            updateHud();
+          }, { once: true });
+        }
+        updateHud();
+        return true;
+      } catch (error) {
+        if (micStream !== stream) stopStream(stream);
+        if (requestedGeneration === audioGeneration) {
+          releaseAudio();
+          audioStartFailed = true;
+          audioGateError = error?.name === "NotAllowedError" ? "microphone-denied" : "microphone-unavailable";
+          updateHud();
+        }
+        return false;
+      }
+    })();
+    audioStartPromise = start;
+    try { return await start; }
+    finally { if (audioStartPromise === start) audioStartPromise = null; }
+  }
+
   function pollAudioOnset(now) {
-    if (!audioAnalyser || !audioBuf) return null;
+    if (!audioAnalyser || !audioBuf || audioCtx?.state !== "running" || !micStream) return null;
     audioAnalyser.getFloatTimeDomainData(audioBuf);
     let sum = 0;
     for (let i = 0; i < audioBuf.length; i++) sum += audioBuf[i] * audioBuf[i];
@@ -931,18 +1240,19 @@
   }
 
   function releaseAudio() {
-    if (micStream) {
-      for (const track of micStream.getTracks()) {
-        try {
-          track.stop();
-        } catch {
-          /* ignore */
-        }
-      }
-      micStream = null;
+    audioGeneration += 1;
+    audioStartPromise = null;
+    stopStream(micStream);
+    micStream = null;
+    for (const node of [audioSource, audioFilter, audioAnalyser]) {
+      try { node?.disconnect(); } catch { /* already disconnected */ }
     }
+    audioSource = null;
+    audioFilter = null;
     audioAnalyser = null;
     audioBuf = null;
+    audioFloorDb = -60;
+    lastOnsetAt = null;
     if (audioCtx && audioCtx.state !== "closed") {
       void audioCtx.close().catch(() => {});
     }
@@ -955,80 +1265,129 @@
 
   let handLandmarker = null;
   let handModelReady = false;
+  let handModelBackend = null;
   let handModelLoading = false;
+  let remoteInferencePending = false;
+  let remoteInferenceToken = 0;
+  let inferenceCanvas = null;
+  let inferenceCtx = null;
+  let handModelError = null;
+  let handModelRetryAt = 0;
+  let handModelFailures = 0;
+  let handModelGeneration = 0;
   let detectHandle = 0;
   let lastInferenceAt = 0;
+  let lastSuccessfulInferenceAt = null;
   let lastTimestampMs = 0;
   const snapHistory = [];
   let lastSnapAt = -Infinity;
   let pendingVisualSnapAt = null;
 
-  /**
-   * MediaPipe Tasks Vision expects `createFromOptions(fileset, options)` where the
-   * fileset is exactly `{ wasmLoaderPath, wasmBinaryPath }`. The 2.0.0 code passed
-   * an empty `wasmLoaderPath` and relied on a global `ModuleFactory`, which fails
-   * silently on Chrome builds where the loader path is required — leaving
-   * `handModelReady === false` forever. We pass both real URLs and validate the
-   * returned handle.
-   */
+  function modelRunAllowed() {
+    return !tornDown && detectionActive() && !(state.cfg.pauseWhenHidden && document.hidden);
+  }
+
+  function releaseHandModel() {
+    handModelGeneration += 1;
+    remoteInferenceToken += 1;
+    remoteInferencePending = false;
+    if (handModelBackend === "offscreen") {
+      try { void chrome.runtime.sendMessage({ type: "HAND_MODEL_RELEASE" }).catch(() => {}); } catch { /* unavailable */ }
+    }
+    try { handLandmarker?.close?.(); } catch { /* already closed */ }
+    handLandmarker = null;
+    handModelBackend = null;
+    handModelReady = false;
+    handModelError = null;
+    handModelRetryAt = 0;
+    handModelFailures = 0;
+    lastSuccessfulInferenceAt = null;
+    snapHistory.length = 0;
+    pendingVisualSnapAt = null;
+    if (inferenceCanvas) { inferenceCanvas.width = 0; inferenceCanvas.height = 0; }
+    inferenceCanvas = null;
+    inferenceCtx = null;
+  }
+
+  /** Prefer local in-page inference. If the host CSP blocks WASM compilation,
+   * use a throttled extension-origin fallback with transient frames only. */
   async function loadHandLandmarker() {
-    if (handModelReady || handModelLoading) return;
-    if (!chrome?.runtime?.getURL) return;
+    if (handModelReady || handModelLoading || !modelRunAllowed() || nowMs() < handModelRetryAt) return;
     handModelLoading = true;
+    const generation = handModelGeneration;
+    let factory = null;
+    let created = null;
     try {
-      const wasmJsUrl = chrome.runtime.getURL("wasm/vision_wasm_module_internal.js");
-      const wasmBinUrl = chrome.runtime.getURL("wasm/vision_wasm_module_internal.wasm");
-      const bundleUrl = chrome.runtime.getURL("vendor/vision_bundle.mjs");
-      const modelUrl = chrome.runtime.getURL("models/hand_landmarker.task");
-
-      // Some builds of the bundle require the module factory to be published on
-      // the global scope before the fileset is instantiated.
+      if (!chrome?.runtime?.getURL) throw new Error("extension runtime unavailable");
       try {
+        const wasmJsUrl = chrome.runtime.getURL("wasm/vision_wasm_module_internal.js");
+        const wasmBinUrl = chrome.runtime.getURL("wasm/vision_wasm_module_internal.wasm");
+        const bundleUrl = chrome.runtime.getURL("vendor/vision_bundle.mjs");
+        const modelUrl = chrome.runtime.getURL("models/hand_landmarker.task");
         const wasmMod = await import(wasmJsUrl);
-        if (wasmMod?.default && !globalThis.ModuleFactory) {
-          globalThis.ModuleFactory = wasmMod.default;
+        factory = wasmMod?.default;
+        if (typeof factory !== "function") throw new Error("WASM module factory unavailable");
+        const vision = await import(bundleUrl);
+        const HandLandmarker = vision.HandLandmarker;
+        if (typeof HandLandmarker?.createFromOptions !== "function") throw new Error("HandLandmarker unavailable");
+        // Empty loader path prevents MediaPipe injecting a classic script into
+        // the meeting page. Its factory is consumed and cleared per task.
+        const fileset = { wasmLoaderPath: "", wasmBinaryPath: wasmBinUrl };
+        const options = {
+          runningMode: "VIDEO", numHands: 1,
+          minHandDetectionConfidence: state.cfg.gesture?.minHandConfidence || 0.62,
+          minHandPresenceConfidence: state.cfg.gesture?.minHandConfidence || 0.62,
+        };
+        for (const delegate of ["GPU", "CPU"]) {
+          if (generation !== handModelGeneration || !modelRunAllowed()) return;
+          try {
+            globalThis.ModuleFactory = factory;
+            created = await HandLandmarker.createFromOptions(fileset, {
+              ...options, baseOptions: { modelAssetPath: modelUrl, delegate },
+            });
+            if (created && typeof created.detectForVideo === "function") break;
+            try { created?.close?.(); } catch { /* ignore */ }
+            created = null;
+          } catch { created = null; }
         }
-      } catch {
-        /* the bundle may embed the factory */
+      } catch { /* Host CSP or local initialization can prevent in-page WASM. */ }
+      if (generation !== handModelGeneration || !modelRunAllowed()) {
+        try { created?.close?.(); } catch { /* ignore */ }
+        return;
       }
-
-      const vision = await import(bundleUrl);
-      const HandLandmarker = vision.HandLandmarker;
-      if (typeof HandLandmarker?.createFromOptions !== "function") {
-        throw new Error("vision bundle missing HandLandmarker");
-      }
-
-      const fileset = { wasmLoaderPath: wasmJsUrl, wasmBinaryPath: wasmBinUrl };
-      const baseOptions = {
-        runningMode: "VIDEO",
-        numHands: 1,
-        minHandDetectionConfidence: state.cfg.gesture?.minHandConfidence || 0.62,
-        minHandPresenceConfidence: state.cfg.gesture?.minHandConfidence || 0.62,
-      };
-
-      let created = null;
-      for (const delegate of ["GPU", "CPU"]) {
-        try {
-          created = await HandLandmarker.createFromOptions(fileset, {
-            ...baseOptions,
-            baseOptions: { modelAssetPath: modelUrl, delegate },
-          });
-          if (created && typeof created.detectForVideo === "function") break;
-          created = null;
-        } catch {
-          created = null;
+      if (created) {
+        handLandmarker = created;
+        created = null;
+        handModelBackend = "in-page";
+      } else {
+        const response = await chrome.runtime.sendMessage({
+          type: "HAND_MODEL_START", payload: { minConfidence: state.cfg.gesture?.minHandConfidence || 0.62 },
+        });
+        if (generation !== handModelGeneration || !modelRunAllowed()) {
+          if (response?.ok) void chrome.runtime.sendMessage({ type: "HAND_MODEL_RELEASE" }).catch(() => {});
+          return;
         }
+        if (!response?.ok) throw new Error(response?.reason || "offscreen model unavailable");
+        handModelBackend = "offscreen";
       }
-      if (!created) throw new Error("HandLandmarker creation failed");
-
-      handLandmarker = created;
       handModelReady = true;
+      handModelError = null;
+      handModelFailures = 0;
+      handModelRetryAt = 0;
     } catch (err) {
-      handModelReady = false;
-      console.info(TAG, "hand model unavailable:", err instanceof Error ? err.message : err);
+      try { created?.close?.(); } catch { /* ignore */ }
+      if (generation === handModelGeneration && !tornDown) {
+        handModelReady = false;
+        handModelBackend = null;
+        handModelError = "model-initialization-failed";
+        handModelFailures += 1;
+        handModelRetryAt = nowMs() + Math.min(60000, 10000 * (2 ** Math.min(handModelFailures - 1, 3)));
+        console.info(TAG, "hand model unavailable:", err instanceof Error ? err.message : err);
+      }
     } finally {
+      if (factory && globalThis.ModuleFactory === factory) delete globalThis.ModuleFactory;
       handModelLoading = false;
-      updateHud();
+      if (!tornDown) updateHud();
     }
   }
 
@@ -1039,7 +1398,7 @@
     return Math.sqrt(dx * dx + dy * dy + dz * dz);
   }
 
-  function evaluateHandSnap(landmarks, worldLandmarks, now) {
+  function evaluateHandSnap(landmarks, worldLandmarks, now, audioNow = now) {
     if (now - lastSnapAt < (state.cfg.gesture?.cooldownMs || 2000)) return false;
     if (!landmarks || landmarks.length < 21) return false;
 
@@ -1073,13 +1432,19 @@
       pendingVisualSnapAt = null;
       return false;
     }
-    if (!audioConfirmRequired() || !audioAnalyser) {
+    if (!audioConfirmRequired()) {
       pendingVisualSnapAt = null;
       lastSnapAt = now;
       snapHistory.length = 0;
       return true;
     }
-    const onset = pollAudioOnset(now);
+    // Smart confirmation is fail-closed: denied, disabled, suspended, or lost
+    // audio must never silently turn a visual candidate into a confirmed snap.
+    if (!microphoneAllowed() || !audioAnalyser || audioCtx?.state !== "running" || !micStream) {
+      pendingVisualSnapAt = null;
+      return false;
+    }
+    const onset = pollAudioOnset(audioNow);
     if (onset !== null && Math.abs(onset - pendingVisualSnapAt) <= win) {
       pendingVisualSnapAt = null;
       lastSnapAt = now;
@@ -1089,85 +1454,153 @@
     return false;
   }
 
+  let detectHandleKind = null;
+  let detectVideo = null;
+  let detectRetryTimer = 0;
+  let inferenceFailures = 0;
+
   function stopDetection() {
-    if (detectHandle && selfVideo?.cancelVideoFrameCallback) {
-      try {
-        selfVideo.cancelVideoFrameCallback(detectHandle);
-      } catch {
-        /* ignore */
-      }
+    if (detectRetryTimer) window.clearTimeout(detectRetryTimer);
+    detectRetryTimer = 0;
+    if (detectHandle) {
+      if (detectHandleKind === "video") {
+        try { detectVideo?.cancelVideoFrameCallback?.(detectHandle); } catch { /* ignore */ }
+      } else window.clearTimeout(detectHandle);
     }
     detectHandle = 0;
+    detectHandleKind = null;
+    detectVideo = null;
   }
 
-  /**
-   * Frame-accurate detection cadence via `requestVideoFrameCallback` (fires once
-   * per decoded camera frame), falling back to a timer where unavailable. Both
-   * paths honour `inferenceFpsLimit`, `document.hidden`, and engine state.
-   */
-  function scheduleDetection() {
-    const video = pickSelfVideo();
-    if (!video) {
-      window.setTimeout(scheduleDetection, 800);
-      return;
-    }
-    const fpsCap = state.cfg.lowPowerMode
-      ? 12
-      : state.cfg.gesture?.inferenceFpsLimit || 20;
-    const minInterval = 1000 / Math.max(8, fpsCap);
+  function queueDetection(delay) {
+    if (tornDown || detectRetryTimer || detectHandle) return;
+    detectRetryTimer = window.setTimeout(() => {
+      detectRetryTimer = 0;
+      scheduleDetection();
+    }, delay);
+  }
 
-    const runInference = () => {
-      if (!handLandmarker || !handModelReady) return;
+  async function requestRemoteInference(video, capturedAt) {
+    if (remoteInferencePending) return;
+    const token = ++remoteInferenceToken;
+    const generation = handModelGeneration;
+    const source = previewSource(video);
+    if (!source) return;
+    remoteInferencePending = true;
+    let timer = 0;
+    try {
+      if (!inferenceCanvas) {
+        inferenceCanvas = document.createElement("canvas");
+        inferenceCtx = inferenceCanvas.getContext("2d", { alpha: false });
+      }
+      if (!inferenceCtx) throw new Error("inference canvas unavailable");
+      const scale = Math.min(1, 256 / video.videoWidth, 256 / video.videoHeight);
+      const width = Math.max(2, Math.floor(video.videoWidth * scale));
+      const height = Math.max(2, Math.floor(video.videoHeight * scale));
+      ensureCanvasSize(inferenceCanvas, width, height);
+      inferenceCtx.drawImage(video, 0, 0, width, height);
+      const frame = inferenceCanvas.toDataURL("image/jpeg", 0.72);
+      const response = await Promise.race([
+        chrome.runtime.sendMessage({ type: "HAND_MODEL_INFER", payload: { frame, timestamp: capturedAt } }),
+        new Promise((resolve) => { timer = window.setTimeout(() => resolve({ ok: false, reason: "timeout" }), 4000); }),
+      ]);
+      if (token !== remoteInferenceToken || generation !== handModelGeneration || !modelRunAllowed()) return;
+      if (pickSelfVideo() !== video || !samePreviewSource(source, previewSource(video))) {
+        snapHistory.length = 0;
+        pendingVisualSnapAt = null;
+        lastSuccessfulInferenceAt = null;
+        return;
+      }
+      if (!response?.ok) {
+        if (response?.reason === "busy") return;
+        throw new Error(response?.reason || "inference unavailable");
+      }
+      inferenceFailures = 0;
+      lastSuccessfulInferenceAt = nowMs();
+      if (response.landmarks?.length && evaluateHandSnap(response.landmarks[0], response.worldLandmarks?.[0], capturedAt, nowMs())) {
+        void triggerGestureAction();
+      }
+    } catch {
+      if (token === remoteInferenceToken && generation === handModelGeneration) {
+        inferenceFailures += 1;
+        if (inferenceFailures >= 3) {
+          releaseHandModel();
+          releaseAudio();
+          handModelError = "model-inference-failed";
+          handModelRetryAt = nowMs() + 10000;
+          inferenceFailures = 0;
+          updateHud();
+        }
+      }
+    } finally {
+      if (timer) window.clearTimeout(timer);
+      if (token === remoteInferenceToken) remoteInferencePending = false;
+    }
+  }
+
+  /** One tracked callback at a time; reselect the camera when it changes. */
+  function scheduleDetection() {
+    if (tornDown || detectHandle || detectRetryTimer) return;
+    const shouldRun = () => modelRunAllowed() && (state.engineState === "live" || state.engineState === "vanished");
+    if (!shouldRun()) { queueDetection(500); return; }
+    const video = pickSelfVideo();
+    if (!video) { queueDetection(800); return; }
+    const fpsCap = state.cfg.lowPowerMode ? 12 : state.cfg.gesture?.inferenceFpsLimit || 20;
+    const minInterval = 1000 / Math.max(8, fpsCap);
+    const onFrame = () => {
+      detectHandle = 0;
+      detectHandleKind = null;
+      detectVideo = null;
+      if (tornDown) return;
+      if (!shouldRun() || pickSelfVideo() !== video) { queueDetection(500); return; }
+      if (!handModelReady && !handModelLoading && nowMs() >= handModelRetryAt) {
+        void loadHandLandmarker().then(() => { if (handModelReady) void ensureAudioGate(); });
+      } else if (handModelReady && microphoneAllowed() && !audioAnalyser && !audioStartPromise && !audioStartFailed) {
+        void ensureAudioGate();
+      }
       const now = nowMs();
-      if (now - lastInferenceAt >= minInterval) {
-        lastInferenceAt = now;
-        pollAudioOnset(now);
-        const ts = Math.max(lastTimestampMs + 1, Math.floor(now));
-        lastTimestampMs = ts;
-        try {
-          const res = handLandmarker.detectForVideo(video, ts);
-          if (res?.landmarks?.length > 0) {
-            if (evaluateHandSnap(res.landmarks[0], res.worldLandmarks?.[0], now)) {
-              void startTransition("toggle");
+      pollAudioOnset(now);
+      const inferenceInterval = handModelBackend === "offscreen" ? Math.max(minInterval, 125) : minInterval;
+      if (handModelReady && now - lastInferenceAt >= inferenceInterval) {
+        if (handModelBackend === "offscreen") {
+          if (!remoteInferencePending) {
+            lastInferenceAt = now;
+            void requestRemoteInference(video, now);
+          }
+        } else if (handLandmarker) {
+          lastInferenceAt = now;
+          const ts = Math.max(lastTimestampMs + 1, Math.floor(now));
+          lastTimestampMs = ts;
+          try {
+            const res = handLandmarker.detectForVideo(video, ts);
+            inferenceFailures = 0;
+            lastSuccessfulInferenceAt = now;
+            if (res?.landmarks?.length > 0 && evaluateHandSnap(res.landmarks[0], res.worldLandmarks?.[0], now)) {
+              void triggerGestureAction();
+            }
+          } catch {
+            inferenceFailures += 1;
+            if (inferenceFailures >= 5) {
+              releaseHandModel();
+              releaseAudio();
+              handModelError = "model-inference-failed";
+              handModelRetryAt = now + 10000;
+              inferenceFailures = 0;
+              updateHud();
             }
           }
-        } catch {
-          /* single poor frame — ignore */
         }
       }
+      scheduleDetection();
     };
-
-    const shouldRun = () =>
-      detectionActive() &&
-      !(state.cfg.pauseWhenHidden && document.hidden) &&
-      (state.engineState === "live" || state.engineState === "vanished");
-
+    detectVideo = video;
     if (typeof video.requestVideoFrameCallback === "function") {
-      const onFrame = () => {
-        detectHandle = 0;
-        if (!shouldRun()) {
-          window.setTimeout(scheduleDetection, 500);
-          return;
-        }
-        if (!handModelReady && !handModelLoading) {
-          void loadHandLandmarker().then(() => void ensureAudioGate());
-        }
-        runInference();
-        detectHandle = video.requestVideoFrameCallback(onFrame);
-      };
+      detectHandleKind = "video";
       detectHandle = video.requestVideoFrameCallback(onFrame);
-      return;
+    } else {
+      detectHandleKind = "timer";
+      detectHandle = window.setTimeout(onFrame, minInterval);
     }
-
-    const tickDetection = () => {
-      detectHandle = window.setTimeout(tickDetection, minInterval);
-      if (!shouldRun()) return;
-      if (!handModelReady && !handModelLoading) {
-        void loadHandLandmarker().then(() => void ensureAudioGate());
-      }
-      runInference();
-    };
-    detectHandle = window.setTimeout(tickDetection, 800);
   }
 
   /* ================================================================== *
@@ -1192,31 +1625,62 @@
     updateHud();
   }
 
-  async function attachSenderStream() {
-    const video = pickSelfVideo();
-    const hello = await handshakeBridge();
-    const size = captureSizeFor(video, hello?.videoSettings);
-    frame.w = size.w;
-    frame.h = size.h;
-    ensureCaptureCanvas(size.w, size.h);
-    if (state.interceptionMode !== "webrtc-sender") return;
+  let transitionGeneration = 0;
+
+  async function attachSenderStream(video, requestedGeneration) {
+    const hello = await handshakeBridge(video);
+    if (requestedGeneration !== transitionGeneration || !["vanishing", "vanished"].includes(state.engineState)) return;
+    if (!hello?.ok || !hello.sendersCount) {
+      state.interceptionMode = "dom-overlay";
+      const visible = syncOverlayRect();
+      if (tileCanvas) tileCanvas.style.display = visible ? "block" : "none";
+      state.renderError = visible ? null : "overlay-unavailable";
+      updateHud();
+      return;
+    }
+    // Prime the correctly sized outgoing canvas before replaceTrack. Otherwise
+    // captureStream can expose its default black/300×150 first frame.
+    const progress = state.engineState === "vanished" ? 1 : clamp((nowMs() - animStartMs) / totalDurationMs(), 0, 1);
+    if (!renderFrame(progress, "webrtc-sender")) {
+      state.renderError = "capture-render-failed";
+      updateHud();
+      return;
+    }
 
     const res = await bridgeRequest("ATTACH_PROCESSED_STREAM", {
       canvasId: "snap-vanish-rtc-canvas",
       fps: state.cfg.lowPowerMode ? 20 : 30,
-    });
-    state.sendersCount = res.sendersCount || 0;
-    if (!res.ok) {
-      // WebRTC swap unavailable → fall back to the on-tile overlay for this and
-      // all subsequent transitions.
-      state.interceptionMode = "dom-overlay";
-      if (tileCanvas) tileCanvas.style.display = "block";
-      updateHud();
+    }, BRIDGE_TIMEOUT_MS, video);
+    if (requestedGeneration !== transitionGeneration || !["vanishing", "vanished"].includes(state.engineState)) {
+      // The user restored while the attach was in flight. A restore is queued
+      // behind it in MAIN world, including when the attach response timed out.
+      void bridgeRequest("RESTORE_ORIGINAL_TRACK");
+      return;
     }
+    state.sendersCount = res.sendersCount ?? 0;
+    if (res.ok) {
+      state.interceptionMode = "webrtc-sender";
+      state.renderError = null;
+      if (tileCanvas) tileCanvas.style.display = "none";
+    } else {
+      // A timed-out attach may still complete later. Cancel it in the bridge;
+      // its transaction queue guarantees that restore follows the pending swap.
+      if (res.reason === "timeout") void bridgeRequest("RESTORE_ORIGINAL_TRACK");
+      state.interceptionMode = res.mode === "webrtc-sender" ? "webrtc-sender" : "dom-overlay";
+      if (state.interceptionMode === "dom-overlay") {
+        const visible = syncOverlayRect();
+        if (tileCanvas) tileCanvas.style.display = visible ? "block" : "none";
+        state.renderError = visible ? null : "overlay-unavailable";
+      } else {
+        state.renderError = "sender-rollback-failed";
+      }
+    }
+    updateHud();
   }
 
   function startTransition(target) {
     if (!state.cfg.enabled) return Promise.resolve({ ok: false, reason: "disabled" });
+    if (plateCaptureDeadline) return Promise.resolve({ ok: false, reason: "capture-pending" });
     if (state.busy) {
       return Promise.resolve({ ok: false, reason: "busy", engineState: state.engineState });
     }
@@ -1228,33 +1692,50 @@
           ? false
           : state.engineState === "live";
 
+    if (goingOut && state.restoreError)
+      return Promise.resolve({ ok: false, reason: "restore-required", engineState: state.engineState });
     if (goingOut && state.engineState === "vanished")
       return Promise.resolve({ ok: true, engineState: state.engineState });
-    if (!goingOut && state.engineState === "live")
-      return Promise.resolve({ ok: true, engineState: state.engineState });
+    if (!goingOut && state.engineState === "live") {
+      return state.restoreError ? emergencyRestore() : Promise.resolve({ ok: true, engineState: state.engineState });
+    }
 
     const video = pickSelfVideo();
+    if (goingOut && !video) {
+      return Promise.resolve({ ok: false, reason: "no-verified-camera-preview", engineState: state.engineState });
+    }
+    const requestedGeneration = ++transitionGeneration;
     ensureSurface();
-    const size = captureSizeFor(video);
-    frame.w = size.w;
-    frame.h = size.h;
-    ensureCaptureCanvas(size.w, size.h);
 
     if (goingOut) {
+      const size = captureSizeFor(video);
+      frame.w = size.w;
+      frame.h = size.h;
+      ensureCaptureCanvas(size.w, size.h);
+      if (!captureCtx || !tileCtx) {
+        state.renderError = "rendering-unavailable";
+        updateHud();
+        return Promise.resolve({ ok: false, reason: "rendering-unavailable", engineState: state.engineState });
+      }
       // Capture the frame we are dissolving *now* — this must be synchronous.
       try {
         buildParticles(video);
       } catch (err) {
-        // A failed readback (GPU pressure, driver reset) must degrade to a plain
-        // plate dissolve rather than aborting the transition.
+        // A failed pixel readback can still degrade to a plain plate dissolve.
         particles.count = 0;
         console.info(TAG, "particle capture failed:", err);
       }
-      if (state.interceptionMode !== "webrtc-sender" && tileCanvas) {
-        tileCanvas.style.display = "block";
-        syncOverlayRect();
+      if (!renderFrame(0, "webrtc-sender")) {
+        state.renderError = "capture-render-failed";
+        updateHud();
+        return Promise.resolve({ ok: false, reason: "rendering-unavailable", engineState: state.engineState });
       }
-      if (state.cfg.muteOnVanish) togglePlatformMicMute(true);
+      state.renderError = null;
+      if (state.interceptionMode !== "webrtc-sender" && tileCanvas) {
+        const visible = syncOverlayRect();
+        tileCanvas.style.display = visible ? "block" : "none";
+      }
+      if (state.cfg.muteOnVanish) mutePlatformForVanish();
     }
 
     state.busy = true;
@@ -1267,7 +1748,7 @@
 
     // The bridge round-trip (up to 400 ms) runs in parallel; the first animation
     // frame must never wait for it.
-    if (goingOut) void attachSenderStream();
+    if (goingOut) void attachSenderStream(video, requestedGeneration);
 
     return Promise.resolve({ ok: true, engineState: state.engineState, interceptionMode: state.interceptionMode });
   }
@@ -1276,6 +1757,7 @@
     if (state.engineState === "vanishing") {
       setEngineState("vanished");
       state.busy = false;
+      updateHud();
       // keep the loop alive (low cadence) so the captured track stays fed
       startLoop();
       return;
@@ -1283,12 +1765,15 @@
     if (state.engineState === "restoring") {
       setEngineState("live");
       state.busy = false;
+      updateHud();
       if (tileCanvas) tileCanvas.style.display = "none";
-      void bridgeRequest("RESTORE_ORIGINAL_TRACK").then(() => {
-        state.sendersCount = 0;
-        state.interceptionMode = "dom-overlay";
-        if (state.cfg.muteOnVanish) togglePlatformMicMute(false);
-        state.mutedByExtension = false;
+      void bridgeRequest("RESTORE_ORIGINAL_TRACK").then((result) => {
+        state.sendersCount = result.sendersCount ?? state.sendersCount;
+        state.restoreError = result.ok ? null : (result.reason || "restore-failed");
+        if (result.ok) { state.interceptionMode = "dom-overlay"; state.renderError = null; }
+        else if (result.mode === "webrtc-sender") state.interceptionMode = "webrtc-sender";
+        // Do not unmute automatically. User or platform mute choices may have
+        // changed since vanish, and DOM labels cannot prove mute ownership.
         updateHud();
       });
       stopLoop();
@@ -1296,6 +1781,8 @@
   }
 
   async function emergencyRestore() {
+    if (plateCaptureDeadline) cancelCleanPlateCapture();
+    transitionGeneration += 1;
     stopLoop();
     state.busy = true;
     setEngineState("live");
@@ -1304,13 +1791,16 @@
       if (tileCtx) tileCtx.clearRect(0, 0, tileCanvas.width, tileCanvas.height);
       tileCanvas.style.display = "none";
     }
-    await bridgeRequest("RESTORE_ORIGINAL_TRACK");
-    state.sendersCount = 0;
-    state.interceptionMode = "dom-overlay";
-    if (state.mutedByExtension) togglePlatformMicMute(false);
-    state.mutedByExtension = false;
+    const result = await bridgeRequest("RESTORE_ORIGINAL_TRACK");
+    state.sendersCount = result.sendersCount ?? state.sendersCount;
+    state.restoreError = result.ok ? null : (result.reason || "restore-failed");
+    if (result.ok) { state.interceptionMode = "dom-overlay"; state.renderError = null; }
+    else if (result.mode === "webrtc-sender") state.interceptionMode = "webrtc-sender";
+    // Emergency camera recovery must not override the user's microphone state.
+    const muted = platformMicControl()?.muted ?? null;
+    if (muted === false) state.mutedByExtension = false;
     updateHud();
-    return { ok: true, engineState: "live", muted: state.mutedByExtension };
+    return { ok: Boolean(result.ok), reason: result.reason, engineState: "live", muted };
   }
 
   /* ================================================================== *
@@ -1319,50 +1809,86 @@
 
   function micSelectors() {
     const host = location.hostname;
-    if (host.endsWith("meet.google.com")) {
-      return ['button[aria-label*="microphone" i]', "button[data-is-muted]"];
+    if (host === "meet.google.com" || host === "teams.microsoft.com" || host === "teams.live.com") {
+      return ['button[aria-label*="microphone" i]', 'button[id*="microphone" i]'];
     }
-    if (host.includes("teams.")) {
-      return [
-        'button[id*="microphone" i]',
-        'button[aria-label*="Mute" i]',
-        'button[aria-label*="Unmute" i]',
-      ];
-    }
-    if (host.includes("zoom.us")) {
-      return [
-        'button[aria-label*="mute my microphone" i]',
-        'button[aria-label*="unmute my microphone" i]',
-      ];
+    if (host === "zoom.us" || host.endsWith(".zoom.us")) {
+      return ['button[aria-label*="microphone" i]', 'button[id*="microphone" i]'];
     }
     return [];
   }
 
-  function togglePlatformMicMute(wantMuted) {
-    // Re-query on demand (only on transitions, never in a loop) so host DOM
-    // refactors never leave us with a stale element handle.
-    for (const sel of micSelectors()) {
-      const btn = document.querySelector(sel);
-      if (!(btn instanceof HTMLElement)) continue;
-      const label = `${btn.getAttribute("aria-label") || ""} ${
-        btn.getAttribute("data-is-muted") || ""
-      }`.toLowerCase();
-      const currentlyMuted =
-        label.includes("unmute") ||
-        label.includes("turn on microphone") ||
-        btn.getAttribute("data-is-muted") === "true";
-      if (wantMuted && !currentlyMuted) {
-        btn.click();
-        state.mutedByExtension = true;
-        return true;
-      }
-      if (!wantMuted && currentlyMuted && state.mutedByExtension) {
-        btn.click();
-        state.mutedByExtension = false;
-        return true;
+  // Clicking a guessed toggle can accidentally unmute the user. Only act when
+  // a microphone-specific control exposes a recognisable state; unknown or
+  // localised labels are deliberately left alone.
+  function platformMicControl() {
+    const candidates = new Map();
+    for (const selector of micSelectors()) {
+      for (const button of document.querySelectorAll(selector)) {
+        if (!(button instanceof HTMLElement) || button.hasAttribute("disabled") || button.getAttribute("aria-disabled") === "true") continue;
+        const label = (button.getAttribute("aria-label") || "").trim().toLowerCase();
+        const mutedLabel = /^(?:unmute (?:my |your |the )?microphone|turn on (?:my |your |the )?microphone)(?:\s*\([^)]*\))?$/.test(label);
+        const liveLabel = /^(?:mute (?:my |your |the )?microphone|turn off (?:my |your |the )?microphone)(?:\s*\([^)]*\))?$/.test(label);
+        if (!mutedLabel && !liveLabel) continue;
+        const muted = mutedLabel;
+        const data = button.getAttribute("data-is-muted");
+        if ((data === "true" && !muted) || (data === "false" && muted)) continue;
+        candidates.set(button, { button, muted });
       }
     }
-    return false;
+    return candidates.size === 1 ? candidates.values().next().value : null;
+  }
+
+  let micClickInProgress = false;
+  function clickPlatformMic(button) {
+    micClickInProgress = true;
+    try { button.click(); }
+    finally { micClickInProgress = false; }
+  }
+  document.addEventListener("click", (event) => {
+    if (micClickInProgress || !state.mutedByExtension) return;
+    const control = platformMicControl();
+    if (control && (control.button === event.target || control.button.contains(event.target))) {
+      state.mutedByExtension = false;
+      updateHud();
+    }
+  }, true);
+
+  function mutePlatformForVanish() {
+    const control = platformMicControl();
+    if (!control || control.muted) return false;
+    try {
+      clickPlatformMic(control.button);
+      state.mutedByExtension = true;
+      return true;
+    } catch { return false; }
+  }
+
+  function triggerGestureAction() {
+    const action = state.cfg.gesture?.actionMapping || "toggle-vanish";
+    if (action === "mute-only") {
+      const control = platformMicControl();
+      if (!control) return { ok: false, reason: "microphone-state-unknown" };
+      if (control.muted) return { ok: true, muted: true };
+      const ok = mutePlatformForVanish();
+      updateHud();
+      return { ok, muted: platformMicControl()?.muted ?? null };
+    }
+    if (action === "vanish-only") return startTransition("vanish");
+    if (action === "restore-only") return startTransition("restore");
+    return startTransition("toggle");
+  }
+
+  function togglePlatformMicByRequest() {
+    const control = platformMicControl();
+    if (!control) return { ok: false, reason: "microphone-state-unknown", muted: null };
+    try {
+      clickPlatformMic(control.button);
+      state.mutedByExtension = false;
+      return { ok: true, requestedMuted: !control.muted, muted: platformMicControl()?.muted ?? null };
+    } catch {
+      return { ok: false, reason: "microphone-control-failed", muted: control.muted };
+    }
   }
 
   /* ================================================================== *
@@ -1380,6 +1906,7 @@
   ]);
   const VALID_CFG_DIRECTIONS = new Set(["left", "right", "up", "down", "toward"]);
   const VALID_CFG_TRIGGER_MODES = new Set(["smart", "gesture-only", "manual"]);
+  const VALID_CFG_GESTURE_ACTIONS = new Set(["toggle-vanish", "vanish-only", "restore-only", "mute-only"]);
   const VALID_CFG_HUD_POSITIONS = new Set([
     "bottom-right",
     "bottom-left",
@@ -1435,6 +1962,7 @@
       };
       gput("enabled", bool(g.enabled));
       gput("detectionMode", oneOf(g.detectionMode, VALID_CFG_TRIGGER_MODES));
+      gput("actionMapping", oneOf(g.actionMapping, VALID_CFG_GESTURE_ACTIONS));
       gput("sensitivity", num(g.sensitivity, 0, 100));
       gput("minHandConfidence", num(g.minHandConfidence, 0.3, 0.95));
       gput("inferenceFpsLimit", num(g.inferenceFpsLimit, 10, 30));
@@ -1470,6 +1998,10 @@
   function applySettings(raw) {
     const patch = sanitizeCfgPatch(raw);
     if (!patch) return;
+    const audioWasAllowed = microphoneAllowed();
+    const detectionWasActive = detectionActive();
+    const previousConfidence = state.cfg.gesture?.minHandConfidence;
+    const wasEnabled = state.cfg.enabled !== false;
     state.cfg = {
       ...state.cfg,
       ...patch,
@@ -1478,10 +2010,21 @@
       camera: { ...state.cfg.camera, ...(patch.camera || {}) },
     };
     state.accentRgb = accentRgb(state.cfg.colorAccent);
+    if (detectionWasActive && (!detectionActive() || previousConfidence !== state.cfg.gesture?.minHandConfidence)) releaseHandModel();
+    else if (!detectionWasActive && detectionActive()) { handModelError = null; handModelRetryAt = 0; }
     // Release the microphone immediately when the policy no longer allows it
     // (mode switched away from Smart, detection paused, audio disabled…).
     if (!microphoneAllowed()) {
       releaseAudio();
+      audioGateError = null;
+    } else if (!audioWasAllowed) {
+      // A deliberate re-enable can retry a denied/ended microphone once.
+      audioStartFailed = false;
+      audioGateError = null;
+    }
+    if (wasEnabled && state.cfg.enabled === false) {
+      clearCleanPlate();
+      if (state.engineState !== "live" || state.restoreError) void emergencyRestore();
     }
     updateHud();
   }
@@ -1518,26 +2061,50 @@
    * ================================================================== */
 
   function snapshotState() {
+    const muted = platformMicControl()?.muted ?? null;
+    if (muted === false) state.mutedByExtension = false;
+    const video = pickSelfVideo();
+    const cameraPresent = Boolean(video);
+    const cleanPlateAvailable = cleanPlateCanvas ? validCleanPlate(video) : false;
+    const audioGateActive = Boolean(audioAnalyser && audioCtx?.state === "running" && micStream);
+    let detectionStatus = "starting";
+    if (!detectionActive()) detectionStatus = detectionMode() === "manual" ? "manual" : "disabled";
+    else if (state.cfg.pauseWhenHidden && document.hidden) detectionStatus = "paused-hidden";
+    else if (!cameraPresent) detectionStatus = "no-camera";
+    else if (!handModelReady) detectionStatus = handModelError ? "model-unavailable" : "model-not-ready";
+    else if (audioConfirmRequired() && !audioGateActive) detectionStatus = (audioGateError || state.cfg.audio?.enabled === false) ? "audio-unavailable" : "waiting-audio";
+    else if (state.busy) detectionStatus = "transitioning";
+    else if (lastSuccessfulInferenceAt !== null && nowMs() - lastSuccessfulInferenceAt < 3000) detectionStatus = "active";
     return {
       ok: true,
       host: location.hostname,
       engineState: state.engineState,
       interceptionMode: state.interceptionMode,
-      // Truthful live status for popup/dashboard (never fabricated):
-      cameraPresent: Boolean(pickSelfVideo()),
+      restoreError: state.restoreError,
+      renderError: state.renderError,
+      cameraPresent,
       detectionEnabled: Boolean(state.cfg.gesture?.enabled),
       detectionMode: detectionMode(),
-      detectionActive: detectionActive(),
+      detectionActive: detectionStatus === "active",
+      detectionStatus,
       handModelReady,
-      audioGateActive: Boolean(audioAnalyser),
+      handModelBackend,
+      handModelError,
+      audioGateActive,
+      audioGateError,
+      cleanPlateStatus: plateCaptureDeadline ? "countdown" : cleanPlateAvailable ? (cleanPlateApproved ? "captured" : "review") : "none",
+      cleanPlateRemaining: plateCaptureDeadline ? Math.max(1, Math.ceil((plateCaptureDeadline - Date.now()) / 1000)) : 0,
+      cleanPlateError: plateCaptureError,
+      backgroundMethod: plateMethod,
       webrtcSendersCount: state.sendersCount,
-      muted: state.mutedByExtension,
+      muted,
+      mutedByExtension: state.mutedByExtension && muted === true,
     };
   }
 
   const messageHandlers = {
     PING: () => bridgeRequest("PING_BRIDGE").then((b) => {
-      state.sendersCount = b.sendersCount || state.sendersCount;
+      state.sendersCount = b.sendersCount ?? state.sendersCount;
       if (b.ok) state.interceptionMode = b.mode || state.interceptionMode;
       return snapshotState();
     }),
@@ -1561,10 +2128,7 @@
     SNAP_TOGGLE: () => startTransition("toggle"),
     SNAP_VANISH_NOW: () => startTransition("vanish"),
     SNAP_RESTORE_NOW: () => startTransition("restore"),
-    MUTE_TOGGLE: () => {
-      const toggled = togglePlatformMicMute(!state.mutedByExtension);
-      return Promise.resolve({ ok: toggled, muted: state.mutedByExtension });
-    },
+    MUTE_TOGGLE: () => Promise.resolve(togglePlatformMicByRequest()),
     EMERGENCY_RESTORE: () => emergencyRestore(),
     RESET_FRAME: () => emergencyRestore(),
     SETTINGS_CHANGED: (msg) => {
@@ -1581,14 +2145,14 @@
       if (!next) releaseAudio();
       return Promise.resolve({ ok: true, detectionEnabled: next });
     },
-    CAPTURE_CLEAN_PLATE: () =>
-      Promise.resolve({ ok: true, note: "clean plate captured on next vanish" }),
-    CALIBRATE_GESTURE: () => Promise.resolve({ ok: true, calibrated: true }),
+    CAPTURE_CLEAN_PLATE: () => Promise.resolve(beginCleanPlateCapture()),
+    REVIEW_CLEAN_PLATE: () => Promise.resolve(showCleanPlatePreview()),
+    CANCEL_CLEAN_PLATE: () => Promise.resolve(plateCaptureDeadline ? cancelCleanPlateCapture() : { ok: false, reason: "no-capture-pending" }),
+    CLEAR_CLEAN_PLATE: () => Promise.resolve(clearCleanPlate()),
+    CALIBRATE_GESTURE: () => Promise.resolve({ ok: false, reason: "use-studio-calibration" }),
     SYNC_DASHBOARD_STATE: () => Promise.resolve(snapshotState()),
-    OFFSCREEN_EVENT: (msg) => {
-      if (msg.payload?.kind === "audio-onset") lastOnsetAt = nowMs();
-      return Promise.resolve({ ok: true });
-    },
+    // The offscreen document does not supply acoustic confirmation for a gesture.
+    OFFSCREEN_EVENT: () => Promise.resolve({ ok: false, reason: "unsupported-offscreen-event" }),
   };
 
   try {
@@ -1623,34 +2187,43 @@
    * ================================================================== */
 
   let tornDown = false;
+  let startupTimer = 0;
   async function teardown() {
     if (tornDown) return;
     tornDown = true;
+    transitionGeneration += 1;
     stopLoop();
     stopDetection();
+    releaseHandModel();
+    if (startupTimer) window.clearTimeout(startupTimer);
     observer?.disconnect();
+    clearCleanPlate();
+    if (personCanvas) { personCanvas.width = 0; personCanvas.height = 0; }
+    if (plateCanvas) { plateCanvas.width = 0; plateCanvas.height = 0; }
+    // Stop listening before awaiting any potentially slow bridge request.
+    releaseAudio();
     if (state.cfg.camera?.autoRestoreOnLeave !== false) {
       await bridgeRequest("RESTORE_ORIGINAL_TRACK");
     }
-    releaseAudio();
-    if (handLandmarker && typeof handLandmarker.close === "function") {
-      try {
-        handLandmarker.close();
-      } catch {
-        /* ignore */
-      }
-    }
-    handLandmarker = null;
-    handModelReady = false;
   }
 
   window.addEventListener("pagehide", () => void teardown());
 
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) return;
+    if (document.hidden) {
+      if (plateCaptureDeadline) cancelCleanPlateCapture("capture-interrupted");
+      if (state.cfg.pauseWhenHidden) {
+        releaseAudio();
+        if (handModelBackend === "offscreen") releaseHandModel();
+      }
+      return;
+    }
+    audioStartFailed = false;
+    audioGateError = null;
     videoCacheDirty = true;
     scheduleRectSync();
     startLoop();
+    scheduleDetection();
   });
 
   /* ================================================================== *
@@ -1678,7 +2251,9 @@
   };
 
   // Warm the bridge + self-view cache without blocking first paint.
-  window.setTimeout(() => {
+  startupTimer = window.setTimeout(() => {
+    startupTimer = 0;
+    if (tornDown) return;
     void handshakeBridge();
     invalidateVideoCache();
     scheduleDetection();

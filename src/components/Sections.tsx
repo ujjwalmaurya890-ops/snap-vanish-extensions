@@ -23,10 +23,9 @@ export function ArchitectureAndInstallSection({
               Local 21-Point Hand AI + Acoustic Gate
             </h3>
             <p className="text-[13px] leading-relaxed text-[#8b92a5]">
-              MediaPipe HandLandmarker runs via bundled WebAssembly inside
-              Chrome&apos;s isolated extension world, paired with a 1.8–4.2 kHz
-              acoustic transient detector so hand gestures while speaking never
-              false-fire.
+              Bundled MediaPipe models run locally, with an extension-document
+              fallback if the meeting page blocks WebAssembly. Optional acoustic
+              confirmation can reduce accidental gesture triggers.
             </p>
           </Card>
 
@@ -35,14 +34,13 @@ export function ArchitectureAndInstallSection({
               <ShieldCheck className="h-4 w-4" />
             </div>
             <h3 className="text-[16px] font-semibold text-white">
-              Auditable Zero-Egress Privacy
+              Local Effect Processing
             </h3>
             <p className="text-[13px] leading-relaxed text-[#8b92a5]">
-              Zero camera frames and zero microphone audio buffers are ever
-              stored or uploaded. Extension settings use{" "}
-              <code className="font-mono text-white">chrome.storage.sync</code>{" "}
-              while optional event metadata stays strictly in{" "}
-              <code className="font-mono text-white">chrome.storage.local</code>.
+              Inference and audio confirmation run locally. A reviewed background
+              plate stays in tab memory and may appear in your outgoing meeting
+              video. Your meeting provider still transmits video and audio; Chrome
+              may synchronize settings when profile sync is enabled.
             </p>
           </Card>
 
@@ -134,7 +132,7 @@ export function Footer() {
           </span>
         </div>
         <div className="font-mono text-[11px]">
-          100% Local Processing · Zero Video/Audio Recording · Emergency Restore{" "}
+          Local Effects · Meeting Video Still Transmitted · Restore{" "}
           <span className="text-[#c9cdd8]">Alt+Shift+R</span>
         </div>
       </div>

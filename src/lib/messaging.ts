@@ -15,6 +15,9 @@ export const VALID_MESSAGE_TYPES: readonly ExtensionMessageType[] = [
   "MUTE_TOGGLE",
   "DETECTION_TOGGLE",
   "CAPTURE_CLEAN_PLATE",
+  "REVIEW_CLEAN_PLATE",
+  "CANCEL_CLEAN_PLATE",
+  "CLEAR_CLEAN_PLATE",
   "OPEN_STUDIO",
   "RESET_FRAME",
   "SETTINGS_CHANGED",
@@ -133,7 +136,9 @@ export function resolveBundledAssetUrl(relativePath: string): string {
   if (g.chrome?.runtime?.id && typeof g.chrome.runtime.getURL === "function") {
     return g.chrome.runtime.getURL(clean);
   }
-  return `./${clean}`;
+  // Dynamic import resolves relative specifiers against the JS bundle, not the
+  // document. Resolve the standalone Studio assets against the page instead.
+  return typeof document !== "undefined" ? new URL(clean, document.baseURI).href : `./${clean}`;
 }
 
 /**

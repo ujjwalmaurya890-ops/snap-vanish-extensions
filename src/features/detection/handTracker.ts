@@ -78,6 +78,8 @@ export class HandLandmarkService {
   private loadProgress = 0;
   private lastError: string | null = null;
   private lastVideoTimestampMs = -1;
+  private generation = 0;
+  private loadingPromise: Promise<{ ok: boolean; error?: string; cancelled?: boolean }> | null = null;
 
   get currentStatus() {
     return this.status;
@@ -95,92 +97,78 @@ export class HandLandmarkService {
     minConfidence?: number;
     enableSegmentation?: boolean;
     onProgress?: ModelLoadProgressCallback;
-  } = {}): Promise<{ ok: boolean; error?: string }> {
+  } = {}): Promise<{ ok: boolean; error?: string; cancelled?: boolean }> {
     if (this.status === "ready" && this.landmarker) {
       options.onProgress?.(100, "Model ready");
       return { ok: true };
     }
-    if (this.status === "loading") {
-      return { ok: false, error: "Model initialization already in progress" };
-    }
+    if (this.loadingPromise) return this.loadingPromise;
 
+    const generation = ++this.generation;
+    const isCurrent = () => generation === this.generation;
     this.status = "loading";
     this.lastError = null;
     this.loadProgress = 10;
     options.onProgress?.(10, "Loading local WebAssembly vision runtime…");
 
-    try {
-      const wasmFileset = await ensureMediaPipeWasmFactory();
-      this.loadProgress = 45;
-      options.onProgress?.(45, "Loading local 21-point hand_landmarker.task…");
-
-      const modelAssetPath = resolveBundledAssetUrl(
-        "models/hand_landmarker.task",
-      );
-      const minConf = Math.max(0.3, Math.min(0.95, options.minConfidence ?? 0.6));
-
+    const operation = (async (): Promise<{ ok: boolean; error?: string; cancelled?: boolean }> => {
+      let landmarker: HandLandmarker | null = null;
+      let segmenter: ImageSegmenter | null = null;
+      const closePending = () => {
+        try { landmarker?.close(); } catch { /* already closed */ }
+        try { segmenter?.close(); } catch { /* already closed */ }
+      };
       try {
-        this.landmarker = await HandLandmarker.createFromOptions(wasmFileset, {
-          baseOptions: {
-            modelAssetPath,
-            delegate: "GPU",
-          },
-          runningMode: "VIDEO",
-          numHands: 1,
-          minHandDetectionConfidence: minConf,
-          minHandPresenceConfidence: minConf,
+        const wasmFileset = await ensureMediaPipeWasmFactory();
+        if (!isCurrent()) return { ok: false, cancelled: true };
+        this.loadProgress = 45;
+        options.onProgress?.(45, "Loading local 21-point hand_landmarker.task…");
+        const modelAssetPath = resolveBundledAssetUrl("models/hand_landmarker.task");
+        const minConf = Math.max(0.3, Math.min(0.95, options.minConfidence ?? 0.6));
+        const create = (delegate: "GPU" | "CPU") => HandLandmarker.createFromOptions(wasmFileset, {
+          baseOptions: { modelAssetPath, delegate }, runningMode: "VIDEO", numHands: 1,
+          minHandDetectionConfidence: minConf, minHandPresenceConfidence: minConf,
           minTrackingConfidence: Math.max(0.3, minConf - 0.08),
         });
-      } catch {
-        // Fallback to CPU delegate if WebGL2/GPU delegate is unavailable on device
-        await ensureMediaPipeWasmFactory();
-        this.landmarker = await HandLandmarker.createFromOptions(wasmFileset, {
-          baseOptions: {
-            modelAssetPath,
-            delegate: "CPU",
-          },
-          runningMode: "VIDEO",
-          numHands: 1,
-          minHandDetectionConfidence: minConf,
-          minHandPresenceConfidence: minConf,
-          minTrackingConfidence: Math.max(0.3, minConf - 0.08),
-        });
-      }
-
-      if (options.enableSegmentation) {
-        this.loadProgress = 80;
-        options.onProgress?.(80, "Loading local selfie_segmentation.tflite…");
-        try {
+        try { landmarker = await create("GPU"); }
+        catch {
+          if (!isCurrent()) return { ok: false, cancelled: true };
           await ensureMediaPipeWasmFactory();
-          this.segmenter = await ImageSegmenter.createFromOptions(wasmFileset, {
-            baseOptions: {
-              modelAssetPath: resolveBundledAssetUrl(
-                "models/selfie_segmentation.tflite",
-              ),
-              delegate: "CPU",
-            },
-            runningMode: "VIDEO",
-            outputConfidenceMasks: true,
-          });
-        } catch {
-          // Segmentation remains optional; temporal/chroma background separation acts as fallback
-          this.segmenter = null;
+          if (!isCurrent()) return { ok: false, cancelled: true };
+          landmarker = await create("CPU");
         }
+        if (!isCurrent()) { closePending(); return { ok: false, cancelled: true }; }
+        if (options.enableSegmentation) {
+          this.loadProgress = 80;
+          options.onProgress?.(80, "Loading local selfie_segmentation.tflite…");
+          try {
+            await ensureMediaPipeWasmFactory();
+            if (!isCurrent()) { closePending(); return { ok: false, cancelled: true }; }
+            segmenter = await ImageSegmenter.createFromOptions(wasmFileset, {
+              baseOptions: { modelAssetPath: resolveBundledAssetUrl("models/selfie_segmentation.tflite"), delegate: "CPU" },
+              runningMode: "VIDEO", outputConfidenceMasks: true,
+            });
+          } catch { segmenter = null; }
+        }
+        if (!isCurrent()) { closePending(); return { ok: false, cancelled: true }; }
+        this.landmarker = landmarker;
+        this.segmenter = segmenter;
+        this.loadProgress = 100;
+        this.status = "ready";
+        options.onProgress?.(100, "MediaPipe HandLandmarker ready");
+        return { ok: true };
+      } catch (err) {
+        closePending();
+        if (!isCurrent()) return { ok: false, cancelled: true };
+        this.status = "error";
+        this.lastError = err instanceof Error ? err.message : "Failed to initialize MediaPipe HandLandmarker";
+        options.onProgress?.(0, this.lastError);
+        return { ok: false, error: this.lastError };
       }
-
-      this.loadProgress = 100;
-      this.status = "ready";
-      options.onProgress?.(100, "MediaPipe HandLandmarker ready");
-      return { ok: true };
-    } catch (err) {
-      this.status = "error";
-      this.lastError =
-        err instanceof Error
-          ? err.message
-          : "Failed to initialize MediaPipe HandLandmarker";
-      options.onProgress?.(0, this.lastError);
-      return { ok: false, error: this.lastError };
-    }
+    })();
+    this.loadingPromise = operation;
+    try { return await operation; }
+    finally { if (this.loadingPromise === operation) this.loadingPromise = null; }
   }
 
   /**
@@ -266,6 +254,8 @@ export class HandLandmarkService {
   }
 
   dispose() {
+    this.generation += 1;
+    this.loadingPromise = null;
     if (this.landmarker) {
       try {
         this.landmarker.close();
@@ -284,6 +274,7 @@ export class HandLandmarkService {
     }
     this.status = "unloaded";
     this.loadProgress = 0;
+    this.lastError = null;
     this.lastVideoTimestampMs = -1;
   }
 }

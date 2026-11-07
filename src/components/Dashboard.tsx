@@ -77,6 +77,7 @@ interface DashboardProps {
   onDuplicatePreset: (preset: EffectPreset) => void;
   onDeletePreset: (id: string) => void;
   onTriggerVanish: () => void;
+  onPreviewEffect: () => void;
   onTriggerRestore: () => void;
   onEmergencyRestore: () => void;
   onOpenCalibration: () => void;
@@ -120,6 +121,7 @@ export default function Dashboard({
   onDuplicatePreset,
   onDeletePreset,
   onTriggerVanish,
+  onPreviewEffect,
   onTriggerRestore,
   onEmergencyRestore,
   onOpenCalibration,
@@ -233,7 +235,7 @@ export default function Dashboard({
                 <div>
                   <div className="rail text-[#ff9d80]">MAIN CONTROL PANEL</div>
                   <h2 className="mt-1 text-[19px] font-semibold text-white">
-                    Live Disintegration &amp; Gesture State
+                    Studio Preview &amp; Meeting Controls
                   </h2>
                 </div>
                 <Badge
@@ -258,10 +260,10 @@ export default function Dashboard({
                   {!settings.enabled
                     ? "Paused"
                     : status === "gone"
-                      ? "Vanished · Clean Plate"
+                      ? "Preview · Vanished"
                       : status === "idle"
-                        ? "Armed · Ready"
-                        : "Transitioning"}
+                        ? "Preview · Ready"
+                        : "Preview · Transitioning"}
                 </Badge>
               </div>
 
@@ -277,7 +279,7 @@ export default function Dashboard({
                   onClick={onTriggerVanish}
                 >
                   <Sparkles className="h-4 w-4" />
-                  Manual Test Vanish
+                  Vanish Meeting + Preview
                 </Button>
 
                 <Button
@@ -290,7 +292,7 @@ export default function Dashboard({
                   }
                   onClick={onTriggerRestore}
                 >
-                  Manual Restore
+                  Return Meeting + Preview
                 </Button>
 
                 <Button variant="danger" onClick={onEmergencyRestore}>
@@ -454,7 +456,7 @@ export default function Dashboard({
                   <div className="mt-1 font-mono text-[18px] font-semibold tabular-nums text-white">
                     {liveMetrics.fps !== null
                       ? `${liveMetrics.fps} FPS`
-                      : "Standby (0% CPU)"}
+                      : "Standby (no frame metrics)"}
                   </div>
                   <div className="mt-0.5 font-mono text-[10.5px] text-[#6c7284]">
                     Render:{" "}
@@ -725,7 +727,7 @@ export default function Dashboard({
           onSavePreset={onSavePreset}
           onDuplicatePreset={onDuplicatePreset}
           onDeletePreset={onDeletePreset}
-          onPreviewEffect={onTriggerVanish}
+          onPreviewEffect={onPreviewEffect}
         />
       )}
 

@@ -14,6 +14,7 @@ import {
   type SnapSettings,
   type ValidationIssue,
 } from "../types/snapVanish";
+import { isExtensionRuntimeAvailable, sendExtensionMessage } from "./messaging";
 
 export const STORAGE_KEYS = {
   SETTINGS: "snap_vanish_settings_v2",
@@ -1244,37 +1245,30 @@ export function saveSettingsSync(settings: SnapSettings): SnapSettings {
   return sanitized;
 }
 
-export async function saveSettings(
-  settings: SnapSettings,
+export async function saveSettingsPatch(
+  patch: Partial<SnapSettings>,
+  snapshot: SnapSettings,
 ): Promise<SnapSettings> {
-  const sanitized = saveSettingsSync(settings);
-  const chromeStorage = getChromeStorage();
-  if (chromeStorage?.sync) {
-    try {
-      // Compact preferences stored in chrome.storage.sync (< 2KB, well under 8KB item quota)
-      await chromeStorage.sync.set({
-        enabled: sanitized.enabled,
-        sensitivity: sanitized.sensitivity,
-        duration: sanitized.duration,
-        direction: sanitized.direction,
-        sound: sanitized.sound,
-        effect: sanitized.effect,
-        speed: sanitized.speed,
-        particleSize: sanitized.particleSize,
-        density: sanitized.density,
-        colorAccent: sanitized.colorAccent,
-        intensity: sanitized.intensity,
-        motionSmoothness: sanitized.motionSmoothness,
-        muteOnVanish: sanitized.muteOnVanish,
-        lowPowerMode: sanitized.lowPowerMode,
-        meetingMode: sanitized.meetingMode,
-        [STORAGE_KEYS.SETTINGS]: sanitized,
-      });
-    } catch {
-      // Fallback remains in localStorage
-    }
+  const sanitized = saveSettingsSync(snapshot);
+  if (isExtensionRuntimeAvailable()) {
+    // The service worker is the sole sync writer; patches avoid overwriting
+    // simultaneous changes made from another surface.
+    const response = await sendExtensionMessage({
+      type: "SETTINGS_CHANGED",
+      payload: patch as unknown as Record<string, unknown>,
+    });
+    if (!response.ok) throw new Error(response.error || response.reason || "Unable to save settings");
+  } else {
+    // Standalone/test contexts without the extension worker can still use a
+    // provided Chrome storage shim. There are no legacy flat mirrors.
+    const chromeStorage = getChromeStorage();
+    if (chromeStorage?.sync) await chromeStorage.sync.set({ [STORAGE_KEYS.SETTINGS]: sanitized });
   }
   return sanitized;
+}
+
+export async function saveSettings(settings: SnapSettings): Promise<SnapSettings> {
+  return saveSettingsPatch(settings, settings);
 }
 
 export function loadPresets(): EffectPreset[] {

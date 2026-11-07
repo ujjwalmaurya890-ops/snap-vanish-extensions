@@ -333,7 +333,8 @@ export interface AppErrorRecord {
     | "dismiss";
   severity: "warning" | "error";
   timestamp: string;
-  autoRestoredCamera: boolean;
+  /** A local preview reset was requested, not a confirmed meeting-camera restore. */
+  autoRestoreRequested: boolean;
 }
 
 export type PlatformSupportLevel =
@@ -365,6 +366,9 @@ export type ExtensionMessageType =
   | "MUTE_TOGGLE"
   | "DETECTION_TOGGLE"
   | "CAPTURE_CLEAN_PLATE"
+  | "REVIEW_CLEAN_PLATE"
+  | "CANCEL_CLEAN_PLATE"
+  | "CLEAR_CLEAN_PLATE"
   | "OPEN_STUDIO"
   | "RESET_FRAME"
   | "SETTINGS_CHANGED"
@@ -389,8 +393,21 @@ export interface ExtensionResponse {
   interceptionMode?: InterceptionMode;
   detectionEnabled?: boolean;
   handModelReady?: boolean;
+  handModelBackend?: "in-page" | "offscreen" | null;
+  handModelError?: string | null;
   webrtcSendersCount?: number;
-  muted?: boolean;
+  muted?: boolean | null;
+  cameraPresent?: boolean;
+  detectionActive?: boolean;
+  detectionStatus?: string;
+  audioGateActive?: boolean;
+  restoreError?: string | null;
+  renderError?: string | null;
+  cleanPlateStatus?: "none" | "countdown" | "review" | "captured";
+  cleanPlateRemaining?: number;
+  cleanPlateError?: string | null;
+  backgroundMethod?: "solid-fallback" | "captured-plate";
+  tabId?: number;
   settings?: Partial<SnapSettings>;
   diagnostics?: Partial<DiagnosticSnapshot>;
   error?: string;

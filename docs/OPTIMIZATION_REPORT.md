@@ -1,5 +1,7 @@
 # Snap Vanish 2.0 — Principal Engineer Optimization Report
 
+> **Historical snapshot:** findings, commands, platform claims, privacy statements, and proposed designs below may be outdated. See [current feature status](FEATURE_STATUS.md), [architecture](ARCHITECTURE.md), and [testing](TESTING.md). Do not run historical branch/reset commands without review.
+
 **Repository:** `ujjwalmaurya890-ops/snap-vanish-extensions`
 **Audit baseline:** `main @ 92f4718` (extension `v2.0.0`, `minimum_chrome_version: 121`)
 **Report date:** 2026-11-01

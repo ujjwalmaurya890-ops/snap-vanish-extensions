@@ -79,8 +79,8 @@
         "https://meet.google.com/*",
         "https://teams.microsoft.com/*",
         "https://teams.live.com/*",
-        "https://*.zoom.us/wc/*",
-        "https://app.zoom.us/wc/*"
+        "https://*.zoom.us/*",
+        "https://app.zoom.us/*"
       ],
       "use_dynamic_url": false
     }
@@ -113,7 +113,7 @@
         "default": "Alt+Shift+R",
         "mac": "Alt+Shift+R"
       },
-      "description": "Emergency restore live camera feed and unmute microphone"
+      "description": "Emergency restore camera; leave microphone state unchanged"
     }
   },
 

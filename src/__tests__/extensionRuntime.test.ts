@@ -170,20 +170,23 @@ describe("7. Chrome Extension Manifest, Service Worker & Content Script Verifica
     expect(stateRes.ok).toBe(true);
     expect(stateRes.engineState).toBe("live");
 
-    // Verify SNAP_VANISH_NOW (previously unhandled in baseline!)
+    // With no verified local camera, fail closed rather than pretending a
+    // remote/no-video fixture was successfully sent to the meeting.
     const vanishRes = await new Promise<Record<string, unknown>>((resolve) => {
       registeredListener!({ type: "SNAP_VANISH_NOW" }, {}, resolve);
     });
-    expect(vanishRes.ok).toBe(true);
-    expect(vanishRes.engineState).toBe("vanishing");
+    expect(vanishRes.ok).toBe(false);
+    expect(vanishRes.reason).toBe("no-verified-camera-preview");
+    expect(vanishRes.engineState).toBe("live");
 
-    // Verify EMERGENCY_RESTORE
+    // A missing bridge is reported, although local UI state is reset.
     const restoreRes = await new Promise<Record<string, unknown>>((resolve) => {
       registeredListener!({ type: "EMERGENCY_RESTORE" }, {}, resolve);
     });
-    expect(restoreRes.ok).toBe(true);
+    expect(restoreRes.ok).toBe(false);
+    expect(restoreRes.reason).toBe("timeout");
     expect(restoreRes.engineState).toBe("live");
-    expect(restoreRes.muted).toBe(false);
+    expect(restoreRes.muted).toBeNull(); // no recognizable meeting mic control
 
     // Verify SETTINGS update
     const settingsRes = await new Promise<Record<string, unknown>>((resolve) => {

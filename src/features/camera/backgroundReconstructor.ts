@@ -71,10 +71,17 @@ export class BackgroundReconstructor {
     if (width === this.width && height === this.height) return;
     this.width = width;
     this.height = height;
+    this.reset();
+  }
+
+  /** Discard camera-derived buffers when a live preview stops. */
+  reset() {
     this.capturedPlate = null;
     this.temporalBuffer = null;
     this.temporalInitialized = false;
     this.prevBorderLuminance = null;
+    this.cameraMotionAlert = false;
+    this.frameCounter = 0;
   }
 
   /**
@@ -356,44 +363,44 @@ export const PLATFORM_COMPATIBILITY_MATRIX: PlatformCompatibilityEntry[] = [
     classification: "Partially implemented",
     verificationStatus: "Tested in automated harness; Untested in live call",
     outgoingStreamMethod:
-      "MAIN-world document_start RTCPeerConnection sender tracking + RTCRtpSender.replaceTrack() swap to processed canvas stream, with automatic fallback to DOM overlay if call started prior to extension load.",
+      "Attempts RTCRtpSender.replaceTrack() only for a verified camera source and matching preview. Otherwise a usable local self-view may show an overlay that other participants cannot see.",
     selfViewOverlaySupport: true,
     knownLimitations: [
       "If Snap Vanish is installed while a Meet tab is already open, the tab must be refreshed once so document_start WebRTC hooks attach.",
-      "Meet's built-in background blur should be turned off so two mattes do not stack.",
+      "Hidden or transformed previews and unknown sender wrappers may prevent replacement or a local overlay.",
     ],
     fallbackWorkflow:
-      "Refresh the Meet tab before joining, or route the Snap Vanish Studio Stage through OBS Virtual Camera.",
+      "Refresh before joining; if replacement remains unavailable, consider an OBS Virtual Camera workflow and verify it separately.",
   },
   {
     id: "microsoft-teams",
     name: "Microsoft Teams (Web)",
-    hostPatterns: ["https://teams.microsoft.com/*"],
+    hostPatterns: ["https://teams.microsoft.com/*", "https://teams.live.com/*"],
     classification: "Partially implemented",
     verificationStatus: "Tested in automated harness; Untested in live call",
     outgoingStreamMethod:
-      "MAIN-world RTCPeerConnection video RTCRtpSender.replaceTrack() + getUserMedia stream monitor, with DOM self-view canvas fallback.",
+      "Attempts RTCRtpSender replacement for a verified camera and matching preview. If available, a local overlay affects only your self-view.",
     selfViewOverlaySupport: true,
     knownLimitations: [
-      "Teams Web occasionally recreates video senders when toggling Together Mode or screen sharing; Snap Vanish re-queries active senders on each transition.",
+      "Camera switching and recreated or wrapped senders may prevent safe identification or restoration.",
       "Desktop Electron Teams app cannot load Chrome extensions directly; use Teams in Chrome/Edge or OBS Virtual Camera.",
     ],
     fallbackWorkflow:
-      "Use Microsoft Teams in Chrome 121+ or capture the Snap Vanish Studio Stage via OBS Virtual Camera.",
+      "Use Teams in Chrome and verify the outgoing result; an OBS Virtual Camera workflow is an unverified alternative.",
   },
   {
     id: "zoom-web",
     name: "Zoom Web Client",
-    hostPatterns: ["https://*.zoom.us/*"],
+    hostPatterns: ["https://*.zoom.us/wc/*", "https://app.zoom.us/wc/*"],
     classification: "Experimental",
     verificationStatus: "Tested in automated harness; Untested in live call",
     outgoingStreamMethod:
-      "Experimental MAIN-world getUserMedia stream proxy + DOM overlay fallback. Zoom Web frequently encodes camera frames via custom WebAssembly/WebCodecs workers rather than standard RTCPeerConnection video senders.",
+      "Experimental WebRTC sender replacement when camera provenance and preview can be verified. Other media pipelines are not intercepted; a local overlay may be available.",
     selfViewOverlaySupport: true,
     knownLimitations: [
-      "When Zoom Web uses its WebAssembly media transport, RTCRtpSender.replaceTrack() has zero video senders; only pre-call getUserMedia proxying or Virtual Camera affects remote participants.",
+      "Some Zoom media pipelines may not expose a replaceable WebRTC sender or a verifiable self-preview. This extension does not provide a getUserMedia stream proxy.",
     ],
     fallbackWorkflow:
-      "Recommended for Zoom: Open Snap Vanish Studio in Live Camera Mode, capture the stage window in OBS Studio -> Start Virtual Camera, and select 'OBS Virtual Camera' in Zoom.",
+      "An unverified alternative is to capture the Studio stage in OBS Studio, start OBS Virtual Camera, and select it in Zoom. Test the result separately.",
   },
 ];
