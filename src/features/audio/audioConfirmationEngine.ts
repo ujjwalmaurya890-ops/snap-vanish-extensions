@@ -66,6 +66,7 @@ export class LiveAudioConfirmationEngine {
     deviceLabel: "Microphone Off",
   };
   private onDisconnectCallback: (() => void) | null = null;
+  private generation = 0;
 
   setSensitivityDb(db: number) {
     this.sensitivityDb = Math.max(6, Math.min(28, db));
@@ -75,19 +76,30 @@ export class LiveAudioConfirmationEngine {
     preferredDeviceId?: string;
     sensitivityDb?: number;
     onDisconnected?: () => void;
-  } = {}): Promise<{ ok: boolean; error?: unknown }> {
+  } = {}): Promise<{ ok: boolean; error?: unknown; cancelled?: boolean }> {
     this.stop();
+    const requestedGeneration = this.generation;
     if (options.sensitivityDb !== undefined) {
       this.setSensitivityDb(options.sensitivityDb);
     }
     this.onDisconnectCallback = options.onDisconnected ?? null;
 
-    if (
-      typeof navigator === "undefined" ||
-      !navigator.mediaDevices?.getUserMedia
-    ) {
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       return { ok: false, error: new Error("MediaDevices unavailable") };
     }
+
+    let stream: MediaStream | null = null;
+    let ctx: AudioContext | null = null;
+    const disposeUnowned = () => {
+      if (stream && this.stream !== stream) {
+        for (const track of stream.getTracks()) {
+          try { if (track.readyState !== "ended") track.stop(); } catch { /* best effort */ }
+        }
+      }
+      if (ctx && this.ctx !== ctx && ctx.state !== "closed") {
+        void ctx.close().catch(() => {});
+      }
+    };
 
     try {
       const audioConstraints: MediaTrackConstraints = {
@@ -98,24 +110,31 @@ export class LiveAudioConfirmationEngine {
       if (options.preferredDeviceId) {
         audioConstraints.deviceId = { exact: options.preferredDeviceId };
       }
+      stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints, video: false });
+      if (requestedGeneration !== this.generation) {
+        disposeUnowned();
+        return { ok: false, cancelled: true };
+      }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: audioConstraints,
-        video: false,
-      });
-
-      const AC =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext })
-          .webkitAudioContext;
-      const ctx = new AC();
+      const AC = window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (!AC) throw new Error("AudioContext unavailable");
+      ctx = new AC();
+      // Publish resources before resuming so stop() can release a pending start.
+      this.stream = stream;
+      this.ctx = ctx;
+      if (ctx.state === "suspended") await ctx.resume();
+      if (requestedGeneration !== this.generation) {
+        disposeUnowned();
+        return { ok: false, cancelled: true };
+      }
+      if (ctx.state !== "running") throw new Error("AudioContext is not running");
       const source = ctx.createMediaStreamSource(stream);
       const bandpass = ctx.createBiquadFilter();
       bandpass.type = "bandpass";
       bandpass.frequency.value =
         (SNAP_CONSTANTS.AUDIO_BAND_HZ[0] + SNAP_CONSTANTS.AUDIO_BAND_HZ[1]) / 2;
       bandpass.Q.value = 1.15;
-
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
       source.connect(bandpass).connect(analyser);
@@ -124,13 +143,13 @@ export class LiveAudioConfirmationEngine {
       if (audioTrack) {
         this.activeDeviceLabel = audioTrack.label || "Microphone Active";
         audioTrack.addEventListener("ended", () => {
+          if (this.stream !== stream) return;
+          const onDisconnected = this.onDisconnectCallback;
           this.stop();
-          this.onDisconnectCallback?.();
-        });
+          onDisconnected?.();
+        }, { once: true });
       }
 
-      this.stream = stream;
-      this.ctx = ctx;
       this.analyser = analyser;
       this.buffer = new Float32Array(new ArrayBuffer(analyser.fftSize * 4));
       this.confirmer.reset();
@@ -143,11 +162,17 @@ export class LiveAudioConfirmationEngine {
       };
       return { ok: true };
     } catch (err) {
+      if (requestedGeneration !== this.generation) {
+        disposeUnowned();
+        return { ok: false, cancelled: true };
+      }
       const name = err instanceof DOMException ? err.name : "";
       if (name === "NotAllowedError" || name === "PermissionDeniedError") {
         this.permissionState = "denied";
       }
-      this.stop();
+      if (this.stream === stream || this.ctx === ctx) this.stop();
+      disposeUnowned();
+      this.lastSnapshot = { ...this.lastSnapshot, active: false, permission: this.permissionState };
       return { ok: false, error: err };
     }
   }
@@ -156,8 +181,8 @@ export class LiveAudioConfirmationEngine {
    * Polls the current audio frame and updates transient onset + level telemetry.
    */
   poll(now = performance.now()): AudioMonitorSnapshot {
-    if (!this.analyser || !this.buffer || !this.stream) {
-      return this.lastSnapshot;
+    if (!this.analyser || !this.buffer || !this.stream || this.ctx?.state !== "running") {
+      return { ...this.lastSnapshot, active: false };
     }
 
     this.analyser.getFloatTimeDomainData(this.buffer);
@@ -219,6 +244,8 @@ export class LiveAudioConfirmationEngine {
   }
 
   stop() {
+    this.generation += 1;
+    this.onDisconnectCallback = null;
     if (this.stream) {
       for (const track of this.stream.getTracks()) {
         try {

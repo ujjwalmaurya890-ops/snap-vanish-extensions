@@ -2,13 +2,13 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>Snap Vanish — Offscreen Audio</title>
+    <title>Snap Vanish — Local Media Processing</title>
   </head>
   <body>
     <!--
       Extension-origin DOM surface. Created on demand by the service worker with
-      `reasons: ["AUDIO_PLAYBACK"]`, which exempts this document from the page's
-      autoplay policy and from the meeting page's CSP.
+      Audio playback and transient Blob decoding run under the extension's CSP.
+      Camera frames used for fallback inference stay in memory and are not stored.
 
       No inline script or style: MV3 `script-src 'self'` forbids it.
     -->

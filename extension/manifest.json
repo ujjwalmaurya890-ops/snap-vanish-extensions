@@ -113,7 +113,7 @@
         "default": "Alt+Shift+R",
         "mac": "Alt+Shift+R"
       },
-      "description": "Emergency restore live camera feed and unmute microphone"
+      "description": "Emergency restore camera; leave microphone state unchanged"
     }
   },
 
