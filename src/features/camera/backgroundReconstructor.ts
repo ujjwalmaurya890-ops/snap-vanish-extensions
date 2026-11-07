@@ -71,10 +71,17 @@ export class BackgroundReconstructor {
     if (width === this.width && height === this.height) return;
     this.width = width;
     this.height = height;
+    this.reset();
+  }
+
+  /** Discard camera-derived buffers when a live preview stops. */
+  reset() {
     this.capturedPlate = null;
     this.temporalBuffer = null;
     this.temporalInitialized = false;
     this.prevBorderLuminance = null;
+    this.cameraMotionAlert = false;
+    this.frameCounter = 0;
   }
 
   /**

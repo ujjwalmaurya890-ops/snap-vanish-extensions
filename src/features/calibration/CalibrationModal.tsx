@@ -52,6 +52,11 @@ export default function CalibrationModal({
 }: CalibrationModalProps) {
   const [step, setStep] = useState(0);
   const [cameraActive, setCameraActive] = useState(false);
+  const [cameraStarting, setCameraStarting] = useState(false);
+  const cameraStartingRef = useRef(false);
+  const cameraGenerationRef = useRef(0);
+  const openRef = useRef(open);
+  openRef.current = open;
   const [syntheticMode, setSyntheticMode] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [handInFrame, setHandInFrame] = useState(false);
@@ -86,6 +91,10 @@ export default function CalibrationModal({
   );
 
   const stopHardware = useCallback(() => {
+    cameraGenerationRef.current += 1;
+    cameraStartingRef.current = false;
+    setCameraStarting(false);
+    handServiceRef.current.dispose();
     const vid = videoRef.current;
     if (vid && vid.srcObject) {
       for (const tr of (vid.srcObject as MediaStream).getTracks()) {
@@ -151,18 +160,22 @@ export default function CalibrationModal({
   );
 
   const startCalibrationCamera = async () => {
+    if (cameraStartingRef.current) return;
     setCameraError(null);
     if (!navigator.mediaDevices?.getUserMedia) {
-      setCameraError(
-        "Browser mediaDevices API unavailable in this environment. You can run Synthetic Kinematic Benchmark Mode below to exercise calibration.",
-      );
+      setCameraError("Browser mediaDevices API unavailable. You can use Synthetic Kinematic Benchmark Mode below.");
       return;
     }
+    const generation = ++cameraGenerationRef.current;
+    cameraStartingRef.current = true;
+    setCameraStarting(true);
+    const isCurrent = () => generation === cameraGenerationRef.current && openRef.current;
+    let stream: MediaStream | null = null;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 360 } },
-        audio: false,
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 360 } }, audio: false,
       });
+      if (!isCurrent()) { stream.getTracks().forEach((track) => track.stop()); return; }
       let vid = videoRef.current;
       if (!vid) {
         vid = document.createElement("video");
@@ -172,22 +185,28 @@ export default function CalibrationModal({
       }
       vid.srcObject = stream;
       await vid.play();
-
-      const res = await handServiceRef.current.initialize({
-        minConfidence: 0.55,
-      });
+      if (!isCurrent()) {
+        stream.getTracks().forEach((track) => track.stop());
+        if (vid.srcObject === stream) vid.srcObject = null;
+        return;
+      }
+      const res = await handServiceRef.current.initialize({ minConfidence: 0.55 });
+      if (!isCurrent() || res.cancelled) return;
       if (!res.ok) {
+        stopHardware();
         setCameraError(res.error ?? "MediaPipe HandLandmarker failed to load");
+        return;
       }
       setCameraActive(true);
       setSyntheticMode(false);
       setStep(1);
     } catch (err) {
-      setCameraError(
-        err instanceof Error
-          ? err.message
-          : "Camera permission denied or no camera hardware detected.",
-      );
+      stream?.getTracks().forEach((track) => track.stop());
+      if (!isCurrent()) return;
+      stopHardware();
+      setCameraError(err instanceof Error ? err.message : "Camera permission denied or no camera hardware detected.");
+    } finally {
+      if (isCurrent()) { cameraStartingRef.current = false; setCameraStarting(false); }
     }
   };
 
@@ -400,7 +419,7 @@ export default function CalibrationModal({
               <p className="text-[13px] leading-relaxed text-[#a1a6b5]">
                 Calibration measures your actual hand geometry, thumb-to-middle
                 tip collapse distance, and approach velocity locally inside
-                WebAssembly. Zero frames leave your device.
+                WebAssembly. Calibration frames are processed locally, not uploaded by the extension.
               </p>
               {cameraError && (
                 <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 p-3.5 text-[12.5px] text-amber-200">
@@ -409,13 +428,14 @@ export default function CalibrationModal({
                 </div>
               )}
               <div className="flex flex-wrap gap-3 pt-1">
-                <Button variant="primary" onClick={startCalibrationCamera}>
+                <Button variant="primary" onClick={startCalibrationCamera} disabled={cameraStarting}>
                   <Camera className="h-4 w-4" />
-                  Start Live Camera Preview
+                  {cameraStarting ? "Starting camera…" : "Start Live Camera Preview"}
                 </Button>
                 <Button
                   variant="secondary"
                   onClick={() => {
+                    stopHardware();
                     setSyntheticMode(true);
                     setHandInFrame(true);
                     setStep(1);
@@ -588,9 +608,9 @@ export default function CalibrationModal({
               </h3>
               <p className="text-[13px] text-[#a1a6b5]">
                 Acoustic confirmation checks for a crisp 1.8–4.2 kHz snap peak
-                within {settings.audio.confirmWindowMs} ms of hand motion so
-                casual hand gestures while talking never falsely trigger vanish.
-                Audio is processed strictly in RAM and never recorded.
+                within {settings.audio.confirmWindowMs} ms of hand motion to
+                help reduce accidental triggers. Accuracy varies with sound and
+                lighting. Audio is analyzed locally, not recorded by the extension.
               </p>
               <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/10 bg-[#181b24] p-4">
                 <div className="flex items-center gap-3">
