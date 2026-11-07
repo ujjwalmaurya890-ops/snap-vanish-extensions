@@ -1,5 +1,7 @@
 # Snap Vanish 2.0 — Phase 1 Complete Technical Audit & Feasibility Report
 
+> **Historical snapshot:** findings, commands, platform claims, privacy statements, and proposed designs below may be outdated. See [current feature status](FEATURE_STATUS.md), [architecture](ARCHITECTURE.md), and [testing](TESTING.md). Do not run historical branch/reset commands without review.
+
 **Audit Date:** 2026-11-01  
 **Repository:** `ujjwalmaurya890-ops/snap-vanish-extensions`  
 **Branch:** `arena/32cb0321-snap-vanish-extensions`  

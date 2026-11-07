@@ -1,5 +1,7 @@
 # Snap Vanish — Complete Project Audit (2.0 → 2.1)
 
+> **Historical snapshot:** findings, commands, platform claims, privacy statements, and proposed designs below may be outdated. See [current feature status](FEATURE_STATUS.md), [architecture](ARCHITECTURE.md), and [testing](TESTING.md). Do not run historical branch/reset commands without review.
+
 **Audit date:** 2026-11-01 · **Branch:** `arena/6f19cffc-snap-vanish-extensions` · **Baseline:** `f06dea5` (v2.0.0, merged PR #3)
 
 Every file in `extension/`, `src/`, `scripts/`, build config, and tests was inspected.

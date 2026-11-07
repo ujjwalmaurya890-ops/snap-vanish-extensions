@@ -1,5 +1,7 @@
 # Phase 0 & Phase 1 — Technical Implementation Audit
 
+> **Historical snapshot:** findings, commands, platform claims, privacy statements, and proposed designs below may be outdated. See [current feature status](FEATURE_STATUS.md), [architecture](ARCHITECTURE.md), and [testing](TESTING.md). Do not run historical branch/reset commands without review.
+
 **Repository:** `ujjwalmaurya890-ops/snap-vanish-extensions`  
 **Branch:** `arena/b1edc8aa-snap-vanish-extensions`  
 **Audit Date:** 2026-10-25  

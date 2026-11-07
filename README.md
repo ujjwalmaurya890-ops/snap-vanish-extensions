@@ -1,219 +1,94 @@
-# Snap Vanish — Chrome Extension & Local Disintegration Studio
+# Snap Vanish
 
-Snap your fingers on camera to disintegrate into warm ember dust and shards — and snap again (or press `Alt+Shift+R`) to reassemble cleanly back into your live feed.
+Snap Vanish is a Chrome Manifest V3 extension and local Effect Studio. It attempts to replace a meeting's outgoing camera with a particle effect when a gesture is detected or a manual control is used.
 
-Snap Vanish (current build **2.1.0** of the 2.0 product line) is a privacy-first **Manifest V3 Chrome Extension** paired with an interactive **Control Center & Personalization Studio** built with React 19, TypeScript, Vite, Tailwind CSS v4, and bundled local **MediaPipe Tasks Vision** WebAssembly models.
+**Do not assume the effect is private or visible to other participants.** Your meeting service still sends video and audio. The popup reports whether the extension changed an outgoing camera sender or only showed a local tile overlay. Check with another participant before relying on it, and use the meeting's own controls if recovery fails.
 
-> Full audit of the codebase (existing / broken / missing / priorities): [`docs/AUDIT_REPORT.md`](docs/AUDIT_REPORT.md) · Honest per-feature status: [`docs/FEATURE_STATUS.md`](docs/FEATURE_STATUS.md)
+## What is implemented
 
----
+- Local MediaPipe hand-landmark inference, with Smart, Gesture, and Manual detection modes. Smart mode requires visual and acoustic confirmation by default; if required audio is denied, disabled, or unavailable, detection stays inactive. Gesture mode uses no microphone; Manual uses no automatic detection. Sound alone cannot trigger a vanish. Smart's audio requirement can also be explicitly turned off.
+- A meeting-page bridge that attempts `RTCRtpSender.replaceTrack()` only for a verified camera source with a matching self-preview. Unknown sources and screen shares are left untouched. If a usable self-preview is available but no safe sender is found, a **local-only** overlay may be shown instead.
+- An in-call, explicitly requested background plate: a five-second countdown followed by preview and approval. If no plate is approved, the in-call effect uses a solid backdrop. The extension cannot determine whether a captured frame is empty.
+- A separate Studio preview, calibration, presets, and settings. Studio's background reconstruction, kinematic detector and some controls differ from the simpler in-call implementation; they are not proof of the meeting output.
+- Emergency Restore requests camera recovery but can fail if the original track ended or the site rejects replacement. It never automatically unmutes the meeting microphone.
 
-## Key Capabilities
+The extension is injected on Meet, Teams Web, and Zoom Web Client URLs listed in `extension/manifest.json`. **No authenticated Meet, Teams, or Zoom call, physical camera/microphone, or OBS Virtual Camera workflow has been verified in this environment.** Site implementations, permissions, previews, and browser versions can affect the result. See [feature status](docs/FEATURE_STATUS.md) and [testing](docs/TESTING.md).
 
-- **Real Local 21-Point Hand Landmark Detection**: Runs `hand_landmarker.task` via bundled MediaPipe Tasks Vision WASM (`vision_wasm_module_internal.{js,wasm}`) inside Chrome's `ISOLATED` world — zero external CDN fetches.
-- **Three Detection Modes** (popup + Settings → Detection):
-  - **Smart Mode** — visual snap gesture confirmed by the acoustic snap transient (default, fewest false triggers).
-  - **Gesture Mode** — visual gesture only; the microphone is never opened.
-  - **Manual Mode** — no automatic detection; trigger from the popup, meeting HUD, or keyboard shortcut.
-  - In every mode, **sound alone can never trigger a vanish**, and detection never runs while the extension is disabled.
-- **Multi-Phase Snap State Machine**: Palm-normalized millimeter geometry (`normalizeLandmarksToMm`), velocity-adaptive landmark smoothing, 4 profiles (`Beginner`, `Balanced`, `Precision`, `Custom`), configurable confidence/cooldown, and a **7-Step Guided Calibration** workflow.
-- **Acoustic Transient Confirmation Gate**: Optional Web Audio bandpass transient monitor with adaptive room noise floor, live input-level indicator, device selector, and synthetic transient self-test. Never records or uploads audio.
-- **Pooled Multi-Effect Particle Engine**: Fine dust + rotating polygon shard fragments, multi-plane z-depth parallax, configurable motion smoothness curves, `visibilitychange` loop suspension, and 6+ built-in presets (`Classic Dust`, `Cinematic Disintegration`, `Fine Particles`, `Energy Burst`, `Gentle Fade`, `Reverse Assembly`, plus Voxel Dissolve and Digital Glitch).
-- **Honest Background Reconstruction & Conferencing Integration**:
-  - Supports Captured Clean Plate, Temporal EMA Background Estimation, Local MediaPipe Selfie Segmentation (`selfie_segmentation.tflite`), and Peripheral Room Fallback.
-  - Uses a `document_start` `MAIN`-world `RTCPeerConnection` / `RTCRtpSender.replaceTrack()` bridge for outgoing WebRTC stream replacement on **Google Meet** and **Microsoft Teams Web**, with automatic fallback to local tile overlay and transparent **OBS Virtual Camera** guidance for **Zoom Web Client**.
-- **Unconditional Emergency Restore (`Alt+Shift+R`)**: Centralized 14-code error recovery service that always restores your hardware camera feed on errors or hotkey trigger.
+## Install and try it
 
-### Vanish effects
+1. Run `npm ci` and `npm run build:extension`; the generated `snap-vanish-chrome-extension.zip` is ignored by Git. Alternatively, extract a package built from a trusted source.
+2. Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select the `extension/` folder (or the extracted package folder).
+3. Refresh an already-open meeting tab so the bridge can observe camera creation. Open the popup and focus the intended meeting tab if several are open.
+4. Test a manual vanish in a low-risk call. Check the popup: **Effect sent** means a verified outgoing sender was changed; **Local tile only** means other participants do not see that overlay. Confirm with another participant.
+5. To recover, use **Emergency Restore** or `Alt+Shift+R`. If it reports failure, use the meeting's camera controls or rejoin. Check the microphone separately; return/restore does not unmute it.
 
-The same effect renders in the Studio preview **and** in live calls (per-effect particle physics in the content script):
+### In-call background capture
 
-| Effect | Internal id | Motion |
-| :--- | :--- | :--- |
-| Classic Dust | `dust` | Directional ember drift with a left-to-right dissolve sweep |
-| Infinity Snap | `cinematic-disintegration` | Particles spiral around you with a hot ember tint before fading |
-| Energy Burst | `light-burst` | Radial outward impulse from your centre |
-| Smoke Dissolve | `fade-out` | Slow, soft, large particles rising like smoke |
-| Digital Disintegration | `digital-glitch` | Coarse blocks with quantised, stepped motion |
-| Fine Ash | `fine-particles` | Tiny particles with a gentle thermal rise |
-| Pixel Rain | `pixel-dissolve` | Random-order pixels that fall away |
-| Reverse Reconstruction | *(restore transition)* | Any return animates particles back into your live feed |
+With a verified live camera preview and the meeting tab focused, choose **Capture plate** in the popup or meeting HUD. Step out of frame during the five-second countdown; other participants may see you leave. Review the captured image in the HUD and explicitly choose **Use this plate** only if it is suitable. It may then appear in outgoing meeting video. Clear it from the popup or HUD; disable, tab teardown, or a detected camera-source change also discards it. The separate Studio plate does not set the in-call plate.
 
-Every effect honours particle density, size, duration, speed, direction, accent colour, intensity, and motion smoothness (Studio sliders + saveable custom presets).
+### Shortcuts
 
-### Keyboard shortcuts
+| Action | Default |
+| --- | --- |
+| Enable / pause extension | `Alt+Shift+S` |
+| Vanish / return | `Alt+Shift+D` |
+| Request microphone toggle | `Alt+Shift+M` |
+| Emergency camera restore | `Alt+Shift+R` |
 
-| Action | Default | Command id |
-| :--- | :--- | :--- |
-| Enable / pause Snap Vanish | `Alt+Shift+S` | `toggle-snap` |
-| Vanish / return immediately | `Alt+Shift+D` | `vanish-now` |
-| Toggle microphone mute | `Alt+Shift+M` | `mute-only` |
-| Emergency restore camera | `Alt+Shift+R` | `emergency-restore` |
+Chrome may reject a conflicting shortcut. The popup shows assigned bindings and links to `chrome://extensions/shortcuts`. Normal commands target the active meeting or the only supported meeting tab; if multiple tabs are ambiguous, focus the intended tab. Emergency Restore attempts every supported meeting tab and reports incomplete attempts. Mic actions require a recognizable, unambiguous meeting control; otherwise the state is unknown and no click is attempted.
 
-The popup reads your **actually assigned** keys live via `chrome.commands.getAll()` (unassigned/conflicting keys show as *Not set*) and its **Customize…** button opens `chrome://extensions/shortcuts`, Chrome's supported rebinding UI.
+## Privacy and data handling
 
----
+- **Meeting transmission:** the meeting provider continues transmitting camera video and microphone audio according to its own controls. An approved background plate and processed frames can be part of outgoing video.
+- **Local inference:** bundled models run in the content-script context where possible. If the host page blocks WebAssembly, automatic detection sends transient JPEG frames through extension messaging to an extension-origin offscreen document for local inference. The longest edge is at most 256 pixels, with at most eight requests per second and four fallback models. Frames are processed in memory and not saved or uploaded by the extension. Compression and lower sampling rates can miss quick gestures.
+- **Audio:** when required in Smart mode, the extension separately requests a microphone stream and analyzes it locally. It does not record or upload that monitor stream. The in-call monitor requests the browser's default microphone; Studio's device selector controls the Studio monitor. The monitor is stopped on pause, mode change, or teardown.
+- **Storage:** in-call plates stay in tab memory; preferences use `chrome.storage.sync` and may sync to other browsers signed into the same Chrome profile. Optional activity/diagnostic metadata and presets use local storage. No camera frames are placed in extension storage by these flows.
+- **Optional services:** models and fonts are bundled/local at runtime. Optional Supabase/billing integrations are enabled only by corresponding `VITE_...` build-time configuration; a self-configured build may contact those services. The legacy `strictLocalOnly` preference is not enforced and cannot block cloud services or Chrome Sync. Dependency installation and `prepare:assets` can use the network. These statements do not describe network traffic from Chrome or the meeting provider.
 
-## Folder Structure
+| Permission | Purpose and scope |
+| --- | --- |
+| `storage` | Preferences, optional local metadata, and per-tab session routing. |
+| `offscreen` | Local cue playback and Blob decoding for the CSP inference fallback. |
+| Host permissions | Declared Meet, Teams, and Zoom origins. Chrome ignores host-permission paths, so Zoom permission covers the matching origin. |
+| Content scripts | Meet/Teams and Zoom Web Client `/wc/*` paths, as specified in the manifest. |
+| Web-accessible resources | Enumerated model/WASM/vendor assets on the declared origins. Chrome requires origin-wide `/*` resource matches. |
+| `'wasm-unsafe-eval'` | Permits bundled WASM in extension pages; it does not override meeting-page CSP. |
 
-```text
-snap-vanish-extensions/
-├── extension/                       # Ready-to-load Chrome Manifest V3 unpacked extension
-│   ├── manifest.json                # MV3 manifest (quoted 'wasm-unsafe-eval', options_page)
-│   ├── background.js                # Service worker (message validation, commands, badge)
-│   ├── content/
-│   │   ├── main-world-bridge.js     # MAIN-world RTCPeerConnection / replaceTrack bridge
-│   │   ├── snap-vanish.js           # ISOLATED-world MediaPipe hand AI, HUD & particle loop
-│   │   └── snap-vanish.css          # Non-intrusive meeting HUD & tile overlay styles
-│   ├── popup/
-│   │   ├── popup.html               # Compact toolbar popup (Obsidian Charcoal + Warm Ember)
-│   │   ├── popup.css
-│   │   └── popup.js
-│   ├── icons/                       # Generated 16/32/48/128 RGBA PNG icons
-│   ├── models/                      # Bundled local hand_landmarker.task & selfie_segmentation.tflite
-│   ├── wasm/                        # Bundled MediaPipe WASM module loader & binary
-│   ├── vendor/                      # Bundled @mediapipe/tasks-vision ESM runtime
-│   └── studio/                      # Compiled Control Center & Studio (options_page)
-├── scripts/
-│   ├── prepare-assets.mjs           # Downloads & SHA-256-verifies local MediaPipe binaries
-│   ├── generate-icons.mjs           # Pure-Node RGBA PNG icon generator
-│   └── build-extension.mjs          # Full Vite build + manifest/CSP audit + zip packager
-├── src/
-│   ├── components/                  # SnapStage, Dashboard, VanishPopup, OnboardingModal, UI kit
-│   ├── features/
-│   │   ├── audio/                   # LiveAudioConfirmationEngine & device enumeration
-│   │   ├── calibration/             # 7-step CalibrationModal
-│   │   ├── camera/                  # BackgroundReconstructor & Platform Compatibility Matrix
-│   │   ├── detection/               # HandLandmarkService (MediaPipe Tasks Vision wrapper)
-│   │   ├── settings/                # 9-section SettingsView + JSON export/import
-│   │   └── studio/                  # PersonalizationStudio & custom preset CRUD
-│   ├── lib/                         # gestureEngine, dust, settings, analytics, diagnostics, messaging
-│   ├── services/                    # Centralized 14-code errorService
-│   ├── types/                       # Canonical v2 TypeScript interfaces
-│   └── __tests__/                   # Vitest unit, integration, DOM/responsive & build tests
-├── docs/                            # Audit report, architecture, feature status & testing docs
-└── snap-vanish-chrome-extension.zip # Packaged unpacked extension release archive
-```
+## Development and verification
 
----
-
-## Development & Build Instructions
-
-### Prerequisites
-- **Node.js** `20+` (verified on Node `22.22.3`) and **npm** `10+`
-- **Google Chrome** `121+` (Windows 10/11, macOS, or Linux)
-
-### Setup & Commands
+The dependency versions currently require **Node 22.22.2+ on the 22.x line** (or a compatible newer Node line); Node 22.22.3 was used for verification. Chrome 121 is the manifest minimum, but that exact version has not been tested here. Packaging currently requires the `zip` and `unzip` CLIs; the optional browser smoke also requires OpenSSL and Node 22+.
 
 ```bash
-# 1. Install dependencies
-npm install
-
-# 2. Provision & SHA-256-verify local MediaPipe WASM & model binaries (if needed)
-npm run prepare:assets
-
-# 3. Start local Control Center & Effect Studio dev server
-npm run dev
-
-# 4. Full verification: strict typecheck -> extension build/package -> test suite
-#    (order matters: the build-integrity test inspects the packaged zip)
-npm run verify
-
-# 5. Or run the steps individually
+npm ci
+npm run dev               # local Studio development server
 npm run typecheck
-npm run build:extension   # web build + sync extension/studio/ + MV3 validation + zip
-npm test                  # 39 automated tests (unit, integration, DOM, build)
+npm test                  # no prebuilt archive required
+npm run build:extension   # builds Studio, validates manifest and creates zip
+npm run test:package      # checks archive CRCs and contents against extension/
+npm run verify            # typecheck, build, package check and tests
+
+# Optional synthetic browser test using a locally installed Chromium/Chrome
+CHROME_BIN=/path/to/chromium npm run test:browser
 ```
 
-**Windows 10/11:** the commands above are identical in PowerShell or Windows Terminal — just run them from the repository folder (e.g. `cd C:\path\to\snap-vanish-extensions`). One caveat: `scripts/build-extension.mjs` shells out to the `zip` CLI to package `snap-vanish-chrome-extension.zip`. On Windows, run the build inside **Git Bash** or **WSL**, or install a `zip` binary (e.g. via `winget install 7zip.7zip` and alias it), or simply load the unpacked `extension\` folder in Chrome directly — the zip is only a distribution convenience.
+`prepare:assets` can provision missing model assets and verifies checksums. `extension/studio/` contains the tracked generated Studio build; rebuild it when changing Studio source. The Studio can also be run as a standalone web app, but it cannot control a meeting without the extension.
 
----
+The browser smoke uses a temporary profile, fake camera, synthetic HTTPS page and restrictive CSP. It checks real model inference, cleanup, output pixels, camera restore, and screen-share isolation; it is **not** a real meeting or gesture-accuracy test. See [testing](docs/TESTING.md) for prerequisites, the sandbox caveat and a manual validation checklist.
 
-## Loading the Unpacked Extension in Chrome (Windows / macOS / Linux)
+## Limitations and troubleshooting
 
-1. Run `npm run build:extension` (or extract `snap-vanish-chrome-extension.zip`).
-2. Open Google Chrome and navigate to `chrome://extensions`.
-3. Enable **Developer mode** using the toggle in the top-right corner.
-4. Click **Load unpacked** in the top-left toolbar.
-5. Select the `extension` directory inside this repository (e.g., `C:\path\to\snap-vanish-extensions\extension` on Windows).
-6. Pin **Snap Vanish** from the Chrome puzzle-piece toolbar menu for one-click popup access, or right-click the icon → **Options** to open the full Control Center & Personalization Studio.
-7. Join (or refresh an already-open tab of) **Google Meet** or **Microsoft Teams Web**.
+- Hidden/transformed self-previews, unknown camera provenance, sender wrappers, tracks created before injection, and non-WebRTC pipelines can prevent replacement. Local overlay itself also requires a usable preview.
+- OBS Virtual Camera is a possible separate workflow, not a guaranteed or tested fallback. Verify it independently.
+- Studio background estimation and segmentation cannot reveal genuinely occluded room details; an in-call plate is manually reviewed, not automatically proven empty.
+- The legacy auto-arm-on-joining preference is not implemented; use the master switch and detection mode. The similarly stored strict-local-only preference does not block network services.
+- If the model or microphone is unavailable, inspect the popup status and use Manual mode. Automatic detection is not guaranteed to recognize every snap or reject every false trigger.
+- If a shortcut is unassigned, rebind it in Chrome. If no meeting is reachable or several are open, focus the intended tab and reopen the popup.
+- Performance depends on hardware, resolution and the meeting. No fixed frame rate or resource usage is guaranteed.
 
----
+## Repository map
 
-## Performance & Architecture Audit
-
-The full principal-engineer optimization report — MV3 lifecycle audit, offscreen/CSP topology,
-particle-engine measurements, WebGL/WebGPU migration path, and the phased roadmap — lives in
-[`docs/OPTIMIZATION_REPORT.md`](docs/OPTIMIZATION_REPORT.md). Reproduce the frame-cost numbers with:
-
-```bash
-npm run bench      # DustScene render-loop micro-benchmark (before/after)
-npm run verify     # typecheck + tests + extension packaging & manifest gates
-```
-
-## Permissions & Privacy Architecture
-
-| Permission / Directive | Scope | Purpose |
-| :--- | :--- | :--- |
-| `storage` | Local, Sync & Session | Compact preferences in `chrome.storage.sync`, optional metadata-only counts/custom presets in `chrome.storage.local`, and per-tab routing state in `chrome.storage.session` (the service worker keeps no in-memory state). |
-| `offscreen` | `AUDIO_PLAYBACK` document | Plays the snap-confirmation cue without an `AudioContext` in the meeting page, and without depending on page user activation (keyboard-shortcut path). |
-| `host_permissions` | The five supported meeting origins | Lets the service worker resolve which meeting tab a command targets. No `tabs`, no `activeTab`, no `<all_urls>`. |
-| `content_scripts` & `web_accessible_resources` | `meet.google.com`, `teams.microsoft.com`, `teams.live.com`, `*.zoom.us/wc/*` | Injects WebRTC sender bridge + isolated MediaPipe hand inference strictly on supported conferencing domains (never `<all_urls>`). |
-| `'wasm-unsafe-eval'` | Extension pages CSP | Required by Chrome Manifest V3 to compile bundled local MediaPipe WebAssembly binaries. Inline scripts remain strictly forbidden. |
-
-**Verified Privacy Guarantees:**
-- **Zero Video or Audio Recording**: Camera frames and Web Audio `Float32Array` buffers exist strictly in volatile RAM for the current frame and are immediately overwritten. No `MediaRecorder` usage exists anywhere in the runtime pipeline.
-- **Zero External Network Requests by Default**: Fonts use local/system stacks and ML models (`hand_landmarker.task`, `selfie_segmentation.tflite`, WASM) load directly from local extension files. Usage counters ("analytics") are **local-only** metadata stored on your machine — nothing is transmitted.
-- **Optional cloud sync is compile-time opt-in and OFF in this build**: `src/lib/cloudAndBilling.ts` only contacts a Supabase endpoint if `VITE_SUPABASE_URL` + `VITE_SUPABASE_ANON_KEY` were set when the app was built. They are not set for the shipped extension, so every cloud action returns `BLOCKED` and no request is ever made. If you self-host, see `.env.example`.
-- **Validated messaging**: all settings payloads crossing extension contexts are allowlisted, type-checked, and range-clamped in the service worker and content script before they reach storage or the render loop.
-- **Microphone discipline**: the mic is opened only in Smart Mode with acoustic confirmation enabled, and is released immediately when you switch modes, pause detection, or disable the extension.
-
----
-
-## Supported Conferencing Platforms & Limitations
-
-| Platform | Outgoing Stream Modification | Self-View Tile Overlay | Verification Status & Notes |
-| :--- | :--- | :--- | :--- |
-| **Google Meet** (`meet.google.com`) | Implemented (`RTCRtpSender.replaceTrack`) | Supported | Tested in automated harness; **Untested in live multi-party call** in headless CI. Refresh Meet tab once if installed mid-call so `document_start` hooks attach. |
-| **Microsoft Teams Web** (`teams.microsoft.com`, `teams.live.com`) | Implemented (`RTCRtpSender.replaceTrack`) | Supported | Tested in automated harness; **Untested in live call**. Disable Teams' built-in background blur to avoid double matting. |
-| **Zoom Web Client** (`*.zoom.us/wc/*`) | Limited (WASM media pipeline) | Supported | Zoom Web frequently encodes video through custom WebAssembly/WebCodecs instead of standard `RTCRtpSender` video tracks. Local overlay works; for outgoing Zoom replacement, capture the Snap Vanish Studio Stage in **OBS Virtual Camera**. |
-
----
-
-## Troubleshooting Guide
-
-- **Installed extension while a call was already open**: Reload the Google Meet or Teams tab once so `content/main-world-bridge.js` (`document_start`) wraps `RTCPeerConnection` before the call negotiates senders.
-- **Camera or Microphone Permission Denied**: Click the site/extension lock icon in Chrome's address bar, allow Camera (and optionally Microphone), then click **Retry** or **Enable Live Webcam + Hand AI**.
-- **Hand snaps not triggering in dim lighting**: Ensure front-facing lighting on your hand, hold your hand 35–65 cm from the webcam, and run the **7-Step Calibration** wizard (`Calibrate` button in the Dashboard header) or select the `Beginner` profile.
-- **Camera appears stuck or you need immediate recovery**: Press `Alt+Shift+R` or click **Emergency Restore** in the Meeting HUD, Toolbar Popup, or Dashboard header. This unconditionally cancels transitions and restores your original hardware `MediaStreamTrack`.
-- **A shortcut does nothing**: Open the popup → Keyboard Shortcuts. If a binding shows *Not set*, Chrome rejected the default (conflict with another extension/OS). Click **Customize…** and reassign it at `chrome://extensions/shortcuts`.
-- **Popup says "No call tab"**: Snap Vanish only activates on Meet/Teams/Zoom-Web tabs. Open (or focus) the meeting tab, then reopen the popup.
-- **Microphone stays closed in Smart Mode**: Check Settings → Audio (confirmation enabled) and the site mic permission. In Gesture/Manual mode the mic is *intentionally* never opened.
-
----
-
-## Testing Report (2026-11-01, build 2.1.0)
-
-| Check | Result |
-| :--- | :--- |
-| `npm run verify` (typecheck → extension build → tests) | ✅ Passed end-to-end |
-| Automated tests | ✅ **39/39** across 4 suites (settings & presets, messaging & SW restart, vanish/restore engine, gesture + audio confirmation, detection-mode policy, DOM/responsive across 5 viewports, manifest/CSP/zip integrity, real content-script boot in jsdom) |
-| Extension package | ✅ `snap-vanish-chrome-extension.zip` (10.42 MB; unpacked 23.1 MB) — MV3 CSP, permission minimality, WAR scoping, and referenced-file checks all pass in `scripts/build-extension.mjs` |
-| Live Google Meet / Teams / Zoom call | ⚠️ **Not performed** — no Chrome binary, webcam, microphone, or accounts in the CI sandbox. Meeting paths are covered by a mocked-WebRTC harness; verify on desktop Chrome before relying on them |
-| Physical webcam/mic hand-snap end-to-end | ⚠️ **Not performed** — requires real hardware; gesture math, audio gate, and calibration logic are unit-tested with synthetic landmarks/transients |
-
-## Known Limitations
-
-- **Zoom Web Client** frequently bypasses standard `RTCRtpSender` video tracks (custom WASM/WebCodecs pipeline): local overlay works, but outgoing-stream replacement is experimental — use the documented **OBS Virtual Camera** workflow for guaranteed Zoom results.
-- **Mid-call installs** need one meeting-tab refresh so the `document_start` bridge wraps `RTCPeerConnection` before senders are negotiated.
-- **Background reconstruction** from a single webcam cannot reveal what is behind always-occluded furniture; capture a clean plate (step out of frame once) for the best result.
-- **Windows zip packaging** needs a `zip` CLI (Git Bash/WSL) as noted above; loading the unpacked `extension\` folder always works.
-- No fixed FPS is promised: particle counts adapt (12 000 max in-call, 5 500 in Low Power) and inference is FPS-capped, but integrated-GPU laptops will vary. Use `npm run bench` to measure on your machine.
-
-## Future Roadmap
-
-- WebGL2 particle renderer for the in-call path (design + measurements in `docs/OPTIMIZATION_REPORT.md`).
-- Two-hand gesture vocabulary (e.g. left-hand snap = mute-only) once single-hand accuracy is field-validated.
-- Per-platform adapter hardening as Meet/Teams DOMs evolve, driven by the diagnostics panel's platform reports.
-- Optional signed `.crx` / Chrome Web Store submission pipeline.
+- `extension/content/`: meeting bridge, renderer, detector, HUD, and reviewed plate capture.
+- `extension/background.js`, `extension/offscreen/`, `extension/popup/`: routing/settings, local media processing, and toolbar UI.
+- `src/`: Studio, settings, calibration, and shared utilities; `extension/studio/` is its generated build.
+- `scripts/`: asset preparation, extension packaging, package verification, and optional browser smoke.
+- `docs/ARCHITECTURE.md`, `docs/FEATURE_STATUS.md`, `docs/TESTING.md`: current design, evidence, and validation guidance. Older audit reports are historical snapshots, not current guarantees.
