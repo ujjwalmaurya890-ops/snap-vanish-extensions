@@ -291,6 +291,7 @@ describe("Snap Vanish 2.0 — Comprehensive Unit, Integration, DOM & Build Suite
         id: "hw-cam-1",
         kind: "video",
         readyState: "live",
+        getSettings: () => ({ width: 640, height: 360 }),
         stop: vi.fn(),
       };
       const canvasVideoTrack = {
@@ -303,14 +304,20 @@ describe("Snap Vanish 2.0 — Comprehensive Unit, Integration, DOM & Build Suite
       // Spec-faithful double: `RTCRtpSender.track` reflects the most recently
       // replaced track, which is what makes the bridge's "already restored"
       // fast-path observable.
-      const mockSender = {
-        track: hardwareCameraTrack as Record<string, unknown>,
-        replaceTrack: vi.fn(async (next: Record<string, unknown>) => {
-          mockSender.track = next;
-          return undefined;
-        }),
-      };
-      const replaceTrackSpy = mockSender.replaceTrack;
+      class MockSender {
+        track = hardwareCameraTrack as Record<string, unknown>;
+        async replaceTrack(next: Record<string, unknown>) {
+          this.track = next;
+        }
+      }
+      const replaceTrackSpy = vi.spyOn(MockSender.prototype, "replaceTrack");
+      const mockSender = new MockSender();
+      (window as unknown as Record<string, unknown>).RTCRtpSender = MockSender;
+      const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+      Object.defineProperty(navigator, "mediaDevices", {
+        configurable: true,
+        value: { getUserMedia: async () => ({ getVideoTracks: () => [hardwareCameraTrack] }) },
+      });
 
       class MockRTCPeerConnection extends EventTarget {
         connectionState = "connected";
@@ -327,6 +334,12 @@ describe("Snap Vanish 2.0 — Comprehensive Unit, Integration, DOM & Build Suite
         "utf8",
       );
       new Function(bridgeCode)();
+      await navigator.mediaDevices.getUserMedia({ video: true });
+      const video = document.createElement("video");
+      Object.defineProperty(video, "srcObject", {
+        value: { getVideoTracks: () => [hardwareCameraTrack] },
+      });
+      document.body.appendChild(video);
 
       // Simulate Google Meet / Teams creating a WebRTC PeerConnection
       const WrappedPC = (
@@ -356,8 +369,9 @@ describe("Snap Vanish 2.0 — Comprehensive Unit, Integration, DOM & Build Suite
             }
           };
           window.addEventListener("snap-vanish:bridge-ack", handler);
-          window.dispatchEvent(
+          (action === "ATTACH_PROCESSED_STREAM" ? video : window).dispatchEvent(
             new CustomEvent("snap-vanish:bridge-cmd", {
+              bubbles: true,
               detail: { requestId, action, canvasId: "snap-vanish-rtc-canvas" },
             }),
           );
@@ -374,6 +388,9 @@ describe("Snap Vanish 2.0 — Comprehensive Unit, Integration, DOM & Build Suite
       expect(canvasVideoTrack.stop).toHaveBeenCalled();
 
       canvas.remove();
+      video.remove();
+      if (originalMediaDevices) Object.defineProperty(navigator, "mediaDevices", originalMediaDevices);
+      else Reflect.deleteProperty(navigator, "mediaDevices");
     });
   });
 
