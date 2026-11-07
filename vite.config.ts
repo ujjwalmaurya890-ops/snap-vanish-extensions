@@ -20,40 +20,73 @@ const MIME_BY_EXT: Record<string, string> = {
  * Serves /models/*, /wasm/*, and /vendor/* directly from extension/ during dev
  * and copies them into dist/ on production build without duplicating binaries in git.
  */
-function localVisionAssetsPlugin(): Plugin {
+export function localVisionAssetsPlugin(projectRoot = __dirname): Plugin {
   const assetFolders = ["models", "wasm", "vendor"];
+  const extensionRoot = path.resolve(projectRoot, "extension");
+  const within = (root: string, file: string) => {
+    const relative = path.relative(root, file);
+    return relative !== "" && relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+  };
 
   return {
     name: "snap-vanish-local-vision-assets",
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
-        const cleanUrl = (req.url || "").split("?")[0];
-        const match = assetFolders.find((dir) =>
-          cleanUrl.startsWith(`/${dir}/`),
-        );
-        if (!match) return next();
-
-        const rel = cleanUrl.replace(/^\/+/, "");
-        const fullPath = path.resolve(__dirname, "extension", rel);
-        const allowedRoot = path.resolve(__dirname, "extension", match);
-        if (!fullPath.startsWith(allowedRoot) || !fs.existsSync(fullPath)) {
-          return next();
+        let pathname: string;
+        try {
+          pathname = decodeURIComponent((req.url || "").split("?")[0]);
+        } catch {
+          res.statusCode = 400;
+          return res.end("Malformed path");
         }
+        const match = assetFolders.find((dir) => pathname.startsWith(`/${dir}/`));
+        if (!match) return next();
+        const reject = (status: 400 | 403 | 404 | 405) => {
+          res.statusCode = status;
+          const messages = { 400: "Bad request", 403: "Forbidden", 404: "Not found", 405: "Method not allowed" };
+          res.end(messages[status]);
+        };
+        if (req.method !== "GET" && req.method !== "HEAD") {
+          res.setHeader("Allow", "GET, HEAD");
+          return reject(405);
+        }
+        // Reject platform separators and NULs even on systems where they would
+        // otherwise be treated as ordinary filename characters.
+        if (pathname.includes("\\") || pathname.includes("\0")) return reject(400);
+        const allowedRoot = path.join(extensionRoot, match);
+        const fullPath = path.resolve(allowedRoot, pathname.slice(match.length + 2));
+        if (!within(allowedRoot, fullPath)) return reject(403);
 
-        const ext = path.extname(fullPath).toLowerCase();
-        res.setHeader(
-          "Content-Type",
-          MIME_BY_EXT[ext] || "application/octet-stream",
-        );
-        res.setHeader("Cache-Control", "public, max-age=3600");
-        fs.createReadStream(fullPath).pipe(res);
+        try {
+          const realExtension = fs.realpathSync(extensionRoot);
+          const realRoot = fs.realpathSync(allowedRoot);
+          // The asset directory itself may not redirect to another folder.
+          if (realRoot !== path.join(realExtension, match)) return reject(403);
+          const realFile = fs.realpathSync(fullPath);
+          if (!within(realRoot, realFile)) return reject(403);
+          if (!fs.statSync(realFile).isFile()) return reject(404);
+
+          const ext = path.extname(fullPath).toLowerCase();
+          res.setHeader("Content-Type", MIME_BY_EXT[ext] || "application/octet-stream");
+          res.setHeader("Cache-Control", "public, max-age=3600");
+          if (req.method === "HEAD") return res.end();
+          const stream = fs.createReadStream(realFile);
+          stream.on("error", () => {
+            if (!res.headersSent) res.statusCode = 500;
+            res.end();
+          });
+          stream.pipe(res);
+        } catch {
+          return reject(404);
+        }
       });
     },
     closeBundle() {
-      const outDir = path.resolve(__dirname, "dist");
+      const outDir = path.resolve(projectRoot, "dist");
       if (!fs.existsSync(outDir)) return;
       for (const folder of assetFolders) {
-        const srcDir = path.resolve(__dirname, "extension", folder);
+        const srcDir = path.join(extensionRoot, folder);
         const destDir = path.resolve(outDir, folder);
         if (fs.existsSync(srcDir)) {
           fs.cpSync(srcDir, destDir, { recursive: true });
@@ -70,13 +103,15 @@ export default defineConfig(({ command }) => {
     base: "./",
     plugins: [react(), tailwindcss(), localVisionAssetsPlugin()],
 
+    // Permit the proxied Arena preview domain without disabling Vite's host
+    // protection for arbitrary domain names. Vite also permits localhost and IPs.
     server: {
       host: "0.0.0.0",
-      allowedHosts: true,
+      allowedHosts: [".e2b.app"],
     },
     preview: {
       host: "0.0.0.0",
-      allowedHosts: true,
+      allowedHosts: [".e2b.app"],
     },
 
     resolve: {

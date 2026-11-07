@@ -63,6 +63,7 @@ npm ci
 npm run dev               # local Studio development server
 npm run typecheck
 npm test                  # no prebuilt archive required
+npm run bench             # JS-only canvas-stub micro-benchmark, not a real call
 npm run build:extension   # builds Studio, validates manifest and creates zip
 npm run test:package      # checks archive CRCs and contents against extension/
 npm run verify            # typecheck, build, package check and tests
@@ -71,9 +72,9 @@ npm run verify            # typecheck, build, package check and tests
 CHROME_BIN=/path/to/chromium npm run test:browser
 ```
 
-`prepare:assets` can provision missing model assets and verifies checksums. `extension/studio/` contains the tracked generated Studio build; rebuild it when changing Studio source. The Studio can also be run as a standalone web app, but it cannot control a meeting without the extension.
+`prepare:assets` can provision missing model assets and verifies checksums. `extension/studio/` contains the tracked generated Studio build; rebuild it when changing Studio source. The Studio can also be run as a standalone web app, but it cannot control a meeting without the extension. The development server binds all interfaces and allows the Arena preview domain, localhost, and IP hosts; it has no authentication and should not be exposed to untrusted networks.
 
-The browser smoke uses a temporary profile, fake camera, synthetic HTTPS page and restrictive CSP. It checks real model inference, cleanup, output pixels, camera restore, and screen-share isolation; it is **not** a real meeting or gesture-accuracy test. See [testing](docs/TESTING.md) for prerequisites, the sandbox caveat and a manual validation checklist.
+The browser smoke uses a temporary profile, fake camera and microphone, synthetic HTTPS page and restrictive CSP. It checks local inference and hidden-tab cleanup, reviewed-plate flow, output pixels, camera restore, and screen-share isolation; it is **not** a real meeting or gesture-accuracy test. See [testing](docs/TESTING.md) for prerequisites, the sandbox caveat and a manual validation checklist.
 
 ## Limitations and troubleshooting
 

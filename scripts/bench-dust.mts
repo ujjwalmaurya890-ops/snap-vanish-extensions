@@ -7,7 +7,7 @@
  * determines whether the frame budget is blown before the compositor ever sees
  * the frame.
  *
- * Run: npx vite-node scripts/bench-dust.mts
+ * Run: npm run bench (Node.js 22.22.2+; built-in TypeScript stripping)
  */
 
 type AnyCtx = Record<string, unknown>;

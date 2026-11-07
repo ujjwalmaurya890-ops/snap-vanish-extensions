@@ -125,7 +125,10 @@ try {
     return result.result.value;
   }
   const worker = await eventually(async () => (await send("Target.getTargets")).targetInfos
-    .find((target) => target.type === "service_worker" && target.url.endsWith("/background.js")), "extension service worker");
+    .find((target) => target.type === "service_worker" && target.url.endsWith("/background.js")), "extension service worker")
+    .catch((error) => {
+      throw new Error(`${error.message}. The browser may not support loading MV3 extensions in headless mode; use a full Chromium/Chrome build, not chrome-headless-shell. Browser log: ${stderr.slice(-1200)}`);
+    });
   const workerSession = (await send("Target.attachToTarget", { targetId: worker.targetId, flatten: true })).sessionId;
   async function openPage(name) {
     const target = (await send("Target.createTarget", { url: `https://meet.google.com:${port}/${name}` })).targetId;
@@ -155,7 +158,9 @@ try {
     self.style.cssText='display:block;width:640px;height:360px';document.body.append(self);await self.play();
     const pc=new RTCPeerConnection();const cameraSender=pc.addTrack(camera.getVideoTracks()[0],camera);
     const screenSender=pc.addTrack(screen.getVideoTracks()[0],screen);
-    window.fixture={camera,self,screen,pc,cameraSender,screenSender,original:cameraSender.track,screenOriginal:screenSender.track};
+    const mic=document.createElement('button');mic.setAttribute('aria-label','Turn off microphone');document.body.append(mic);
+    window.fixture={camera,self,screen,pc,cameraSender,screenSender,mic,micClicks:0,original:cameraSender.track,screenOriginal:screenSender.track};
+    mic.addEventListener('click',()=>{fixture.micClicks++;mic.setAttribute('aria-label',mic.getAttribute('aria-label')==='Turn off microphone'?'Turn on microphone':'Turn off microphone')});
     return {width:self.videoWidth,height:self.videoHeight};})()`);
   assert(fixture.width > 64 && fixture.height > 64, "Fake camera did not start");
   // Headless Chromium may otherwise leave a newly created target backgrounded,
@@ -173,8 +178,41 @@ try {
   assert.equal(model.audioGateActive, false, "Gesture-only unexpectedly opened microphone");
   const before = await evaluate(workerSession, "chrome.runtime.sendMessage({type:'OFFSCREEN_STATUS'})");
   assert.equal(before.handModelCount, 1);
+
+  // Exercise a real visibility transition in Smart mode with a fake microphone:
+  // a hidden tab releases its offscreen model and audio gate, then reinitializes
+  // both when the user returns to the tab.
+  await sendToPage("fixture", { type: "SETTINGS", payload: {
+    pauseWhenHidden: true,
+    gesture: { detectionMode: "smart", requireAudioConfirm: true },
+    audio: { enabled: true },
+  } });
+  await eventually(async () => {
+    const state = await sendToPage("fixture", { type: "GET_STATE" });
+    return state.audioGateActive && state.detectionActive;
+  }, "Smart mode fake microphone gate", 30_000);
+  const focusTarget = (await send("Target.createTarget", { url: "about:blank" })).targetId;
+  const focusSession = (await send("Target.attachToTarget", { targetId: focusTarget, flatten: true })).sessionId;
+  await send("Target.activateTarget", { targetId: focusTarget });
+  await send("Page.bringToFront", {}, focusSession);
+  await eventually(() => evaluate(page.session, "document.hidden"), "meeting tab to become hidden");
+  await eventually(async () => (await evaluate(workerSession, "chrome.runtime.sendMessage({type:'OFFSCREEN_STATUS'})")).handModelCount === 0, "hidden-tab model release");
+  const hiddenState = await sendToPage("fixture", { type: "GET_STATE" });
+  assert.equal(hiddenState.detectionStatus, "paused-hidden");
+  assert.equal(hiddenState.audioGateActive, false);
+  await send("Target.activateTarget", { targetId: page.target });
+  await send("Page.bringToFront", {}, page.session);
+  await eventually(() => evaluate(page.session, "!document.hidden"), "meeting tab to become visible");
+  await eventually(async () => {
+    const state = await sendToPage("fixture", { type: "GET_STATE" });
+    return state.handModelBackend === "offscreen" && state.detectionActive && state.audioGateActive;
+  }, "inference and fake microphone resumption after visibility change", 45_000);
+  await send("Target.closeTarget", { targetId: focusTarget });
+  console.log("✓ Hidden tab: model/audio release and visible-tab resumption");
+
   await sendToPage("fixture", { type: "SETTINGS", payload: { gesture: { detectionMode: "manual" } } });
   await eventually(async () => (await evaluate(workerSession, "chrome.runtime.sendMessage({type:'OFFSCREEN_STATUS'})")).handModelCount === 0, "offscreen model release");
+  assert.equal((await sendToPage("fixture", { type: "GET_STATE" })).audioGateActive, false, "Manual mode kept the audio gate active");
   console.log("✓ Restrictive CSP: real local inference and model release");
 
   const start = await sendToPage("fixture", { type: "SNAP_VANISH_NOW" });
@@ -198,6 +236,63 @@ try {
   assert.equal((await sendToPage("fixture", { type: "EMERGENCY_RESTORE" })).ok, true);
   assert(await evaluate(page.session, "fixture.cameraSender.track===fixture.original && fixture.screenSender.track===fixture.screenOriginal"));
   console.log("✓ Outgoing pixels, camera restoration, and screen-share isolation");
+
+  const capture = await sendToPage("fixture", { type: "CAPTURE_CLEAN_PLATE" });
+  assert.equal(capture.ok, true, JSON.stringify(capture));
+  assert.equal(capture.cleanPlateStatus, "countdown");
+  await eventually(async () => (await sendToPage("fixture", { type: "GET_STATE" })).cleanPlateStatus === "review", "plate review after countdown", 10_000);
+  await send("DOM.enable", {}, page.session);
+  const hudDom = await send("DOM.getFlattenedDocument", { depth: -1, pierce: true }, page.session);
+  const usePlateNode = hudDom.nodes.find((item) => item.nodeName === "BUTTON" && item.attributes?.includes("sv-hud-use-plate"));
+  assert(usePlateNode, "Plate approval button not found");
+  const button = (await send("DOM.resolveNode", { nodeId: usePlateNode.nodeId }, page.session)).object;
+  // A page-script click is not sufficient; approval requires a trusted user action.
+  await send("Runtime.callFunctionOn", { objectId: button.objectId, functionDeclaration: "function(){this.click()}", returnByValue: true }, page.session);
+  assert.equal((await sendToPage("fixture", { type: "GET_STATE" })).cleanPlateStatus, "review", "Untrusted click approved plate");
+  assert.equal((await sendToPage("fixture", { type: "SNAP_VANISH_NOW" })).ok, true);
+  const unapprovedState = await eventually(async () => {
+    const state = await sendToPage("fixture", { type: "GET_STATE" });
+    return state.engineState === "vanished" ? state : false;
+  }, "unapproved-plate vanish");
+  assert.equal(unapprovedState.backgroundMethod, "solid-fallback");
+  assert.equal((await sendToPage("fixture", { type: "EMERGENCY_RESTORE" })).ok, true);
+
+  const box = (await send("Runtime.callFunctionOn", { objectId: button.objectId,
+    functionDeclaration: "function(){const r=this.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2,width:r.width,height:r.height}}",
+    returnByValue: true }, page.session)).result.value;
+  assert(box.width > 0 && box.height > 0, "Plate approval is not visible");
+  await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: box.x, y: box.y }, page.session);
+  await send("Input.dispatchMouseEvent", { type: "mousePressed", x: box.x, y: box.y, button: "left", clickCount: 1 }, page.session);
+  await send("Input.dispatchMouseEvent", { type: "mouseReleased", x: box.x, y: box.y, button: "left", clickCount: 1 }, page.session);
+  await eventually(async () => (await sendToPage("fixture", { type: "GET_STATE" })).cleanPlateStatus === "captured", "trusted plate approval");
+  assert.equal((await sendToPage("fixture", { type: "SNAP_VANISH_NOW" })).ok, true);
+  const plateState = await eventually(async () => {
+    const state = await sendToPage("fixture", { type: "GET_STATE" });
+    return state.engineState === "vanished" ? state : false;
+  }, "approved-plate vanish");
+  assert.equal(plateState.backgroundMethod, "captured-plate");
+  assert.equal((await sendToPage("fixture", { type: "CLEAR_CLEAN_PLATE" })).ok, true);
+  assert.equal((await sendToPage("fixture", { type: "GET_STATE" })).cleanPlateStatus, "none");
+  assert.equal((await sendToPage("fixture", { type: "EMERGENCY_RESTORE" })).ok, true);
+  assert(await evaluate(page.session, "fixture.cameraSender.track===fixture.original"));
+  console.log("✓ Plate countdown, trusted review/approval, use, clearing, and restore");
+
+  // The fixture's mock meeting button starts unmuted. Automatic mute may click
+  // it once, but repeated vanishes and camera restores must not unmute it.
+  await sendToPage("fixture", { type: "SETTINGS", payload: { muteOnVanish: true } });
+  for (let i = 0; i < 2; i++) {
+    assert.equal((await sendToPage("fixture", { type: "SNAP_VANISH_NOW" })).ok, true);
+    await eventually(async () => (await sendToPage("fixture", { type: "GET_STATE" })).engineState === "vanished", "muted vanish");
+    assert.equal((await sendToPage("fixture", { type: "EMERGENCY_RESTORE" })).ok, true);
+    const micState = await evaluate(page.session, "({label:fixture.mic.getAttribute('aria-label'),clicks:fixture.micClicks})");
+    assert.deepEqual(micState, { label: "Turn on microphone", clicks: 1 });
+  }
+  await evaluate(page.session, "(()=>{const b=fixture.mic.cloneNode();document.body.append(b)})()");
+  const ambiguousMic = await sendToPage("fixture", { type: "MUTE_TOGGLE" });
+  assert.equal(ambiguousMic.ok, false);
+  assert.equal(ambiguousMic.reason, "microphone-state-unknown");
+  assert.equal(await evaluate(page.session, "fixture.micClicks"), 1);
+  console.log("✓ Synthetic meeting mic remains muted on restore and ambiguous controls are ignored");
 
   const local = await openPage("overlay");
   await eventually(async () => (await sendToPage("overlay", { type: "SETTINGS", payload: {
